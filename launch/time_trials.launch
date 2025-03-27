@@ -1,0 +1,10 @@
+<launch>
+    <!-- My Package launch file -->
+    <node pkg="my_controller"
+            type="time_trials_controller.py"
+            name="time_trials_controller" 
+            output="screen">
+    </node>
+
+    <!-- <include file="$(find enph353_utils)/launch/sim.launch"/> -->
+</launch>
