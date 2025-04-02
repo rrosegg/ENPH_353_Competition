@@ -6,6 +6,7 @@ from std_msgs.msg import String
 import cv2
 from sensor_msgs.msg import Image # Is this needed?
 from cv_bridge import CvBridge, CvBridgeError
+import numpy as np
 
 import json  # for saving config from GUI
 
@@ -33,6 +34,11 @@ class PID_control:
     STATE_UNPAVED  = 1
     STATE_OFFROAD  = 2
     STATE_MOUNTAIN = 3
+    AVOID_YODA     = 444
+    CP_ICE_SLICK   = 5
+    CHILLIN        = 6
+
+    INTEGRAL_CEILING = 100
 
     def __init__(self):
         rospy.init_node('topic_publisher', anonymous=True)
@@ -41,19 +47,22 @@ class PID_control:
         self.pub_cmd = rospy.Publisher('/B1/cmd_vel', Twist, queue_size=1)
         self.pub_cb_detected = rospy.Publisher('/cb_detected', String, queue_size=1)
         self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
-        self.image_sub = rospy.Subscriber("/robot/camera1/image_raw", Image, self.callback) # Make this Low-Res
+        ''' Remove the image subscriber initialization here, it's causing issues.'''
+        # self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.process_image) # Make this Low-Res
+        # Is the correct path to the above actually this? "/B1/rrbot/camera1/image_raw" -- no hell nah
+        # Old path: /robot/camera1/image_raw
         self.bridge = CvBridge()
 
         # PID Control Parameters
-        self.Kp = 0.05     # Proportional gain  
-        self.Ki = 0.001    # Integral gain 
-        self.Kd = 0.002     # Derivative gain 
+        self.Kp = 0.1     # Proportional gain  
+        self.Ki = 0.0    # Integral gain  ---- 0.001
+        self.Kd = 0.0     # Derivative gain  ---- 0.002
         self.prev_error = 0
         self.integral = 0
 
         # Speed Limits
-        self.maxspeed = 1.50
-        self.reducedspeed = 0.50
+        self.maxspeed = 2.0 # 1.0 works
+        self.reducedspeed = 1.0 # 0.5 works
 
         # State Control (initialized for first paved section)
         self.state = 0 # Update as we cross pink lines
@@ -92,6 +101,8 @@ class PID_control:
     # Returns correction value: u(t) = Kp*err + Ki*integral(err) + Kp*d/dt(err) 
     def pid_control(self, error):
         self.integral += error # Sums error
+        if abs(self.integral) > self.INTEGRAL_CEILING:
+            self.integral = self.INTEGRAL_CEILING if self.integral > 0 else (-1*self.INTEGRAL_CEILING)
         derivative = error - self.prev_error # Difference term for sign
         self.prev_error = error # Update error
         return (self.Kp * error) + (self.Ki * self.integral) + (self.Kd * derivative)
@@ -101,18 +112,28 @@ class PID_control:
     def count_colorpix(self, img, color_name):
         """Return number of pixels matching the given color in the image."""
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        rgb = img
 
         if color_name == "blue":
             lower = np.array([100, 150, 50])
             upper = np.array([130, 255, 255]) ## Play with these
         elif color_name == "pink":
-            lower = np.array([140, 50, 50])
-            upper = np.array([170, 255, 255])
+            # lower = np.array([140, 50, 50])
+            # upper = np.array([170, 255, 255])
+            # ## 
+            lower = np.array([290, 90, 90])
+            upper = np.array([310, 101, 101]) # 300,100,100 is the color!!
+
+            ## Pink is 255,0,255
+        elif color_name == "red":
+            lower = np.array([250,0,0])
+            upper = np.array([256,0,0])
         else:
             rospy.logwarn(f"Unknown color requested: {color_name}")
             return 0
 
-        mask = cv2.inRange(hsv, lower, upper)
+        # mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(rgb, lower, upper)
         pixel_count = cv2.countNonZero(mask)
 
         # Optional: show mask for debugging
@@ -123,32 +144,32 @@ class PID_control:
 
     # Scan for blue and publish to cb_detected
     def cb_detector(self, cv_image):
-        min_blue = 100 # At least 100 bluepix to trigger "cb detected -> yes"
+        min_blue = 200 # At least 200 bluepix to trigger "cb detected -> yes"
         bluepix = self.count_colorpix(cv_image, "blue")
-        cb_detected = 'yes' if (bluepix > N) else 'no'
+        cb_detected = 'yes' if (bluepix > min_blue) else 'no'
         self.pub_cb_detected.publish(cb_detected)
 
-    def scan_pink(self, cv_image):
-        current_pink = self.count_colorpix(cv_image, "pink")
-        '''
-        Existing code could potentially double update:
-        '''
+    def scan_pink(self, roi):
+        '''Existing code could potentially double update:'''
+        current_pink = self.count_colorpix(roi, "pink")
+
         if current_pink > 0:
             self.consec_pink_frames += 1
             # self.consec_pinkless = 0
         else:
+            if (self.consec_pink_frames > 10):
+                self.state += 1
+                self.update_state()    
+                print("STATE UPDATED: NOW IN STATE ", self.state)
+
             self.consec_pink_frames = 0
             # self.consec_pinkless += 1
-
-        if (current_pink = 0 and self.consec_pink_frames > 10):
-            state += 1
-            self.update_state()
 
         self.pinkpix = current_pink # Update at the end.
 
     def update_state(self):
         # Update internal params based on current terrain state
-        if self.state == STATE_PAVED:
+        if self.state == self.STATE_PAVED:
             rospy.loginfo("Switched to: PAVED")
             self.Kp = 0.05
             self.Ki = 0.001
@@ -158,23 +179,27 @@ class PID_control:
             self.reducedspeed = 0.5
             self.obj_detection = True
 
-        elif self.state == STATE_UNPAVED:
+        elif self.state == self.STATE_UNPAVED:
             rospy.loginfo("Switched to: UNPAVED")
-            self.Kp = 0.04
-            self.Ki = 0.002
-            self.Kd = 0.003
-            self.thresh_val = 230
+            # self.Kp = 0.04
+            # self.Ki = 0.002
+            # self.Kd = 0.003
+            '''Troubleshooting:'''
+            self.Kp = 1.0
+            self.Ki = 1.0
+            self.Kd = 1.0
+            self.thresh_val = 170
             self.maxspeed = 1.2
             self.reducedspeed = 0.4
             self.obj_detection = False
 
-        elif self.state == STATE_OFFROAD:
+        elif self.state == self.STATE_OFFROAD:
             rospy.loginfo("Switched to: OFFROAD")
             self.obj_detection = False
             # Insert logic for follow-yoda or hardcoded path
             self.handle_offroad()
 
-        elif self.state == STATE_MOUNTAIN:
+        elif self.state == self.STATE_MOUNTAIN:
             rospy.loginfo("Switched to: MOUNTAIN")
             self.Kp = 0.03
             self.Ki = 0.001
@@ -186,6 +211,8 @@ class PID_control:
 
         else:
             rospy.logwarn(f"Unknown state: {self.state}")
+
+            
 
     def handle_offroad(self):
         pass
@@ -199,7 +226,7 @@ class PID_control:
         img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
         thickness, blue = 2, (255,0,0)
         for y in y_coords:
-            start, stop = (0, y), (colored.shape[1], y)
+            start, stop = (0, y), (img.shape[1], y)
             cv2.line(img, start, stop, blue, thickness)
         return img
 
@@ -239,6 +266,55 @@ class PID_control:
 
 
 
+
+    # def detect_lane_blobs(self, thresh):
+    #     """
+    #     Detect two main white blobs (lane lines) and return their x-centers.
+    #     """
+    #     # Set up SimpleBlobDetector parameters.
+    #     params = cv2.SimpleBlobDetector_Params()
+    #     params.filterByArea = True
+    #     params.minArea = 100    # Adjust based on resolution
+    #     params.maxArea = 50000  # Prevent huge noise blobs
+    #     params.filterByCircularity = False
+    #     params.filterByConvexity = False
+    #     params.filterByInertia = False
+    #     params.blobColor = 255  # Looking for white blobs in binary image
+
+    #     detector = cv2.SimpleBlobDetector_create(params)
+
+    #     # Detect blobs
+    #     keypoints = detector.detect(thresh)
+
+    #     # Sort blobs by size (descending)
+    #     keypoints = sorted(keypoints, key=lambda k: k.size, reverse=True)
+
+    #     if len(keypoints) < 2:
+    #         return None, thresh  # Not enough blobs found
+
+    #     # Get the two largest blobs
+    #     left_blob = keypoints[0].pt  # (x, y)
+    #     right_blob = keypoints[1].pt
+
+    #     # if (right_blob[0] - left_blob[0]) < 10:
+    #     #     for n in keypoints:
+    #     #         right_blob = keypoints[n]
+    #     #         if (right_blob[0] - left_blob[0]) > 10:
+    #     #             break
+    #             ### If we never break then find out how to handle this.
+                    
+
+    #     # Optional: draw blobs
+    #     out_img = cv2.drawKeypoints(thresh, keypoints[:2], None, (0, 0, 255),
+    #                                 cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    #     cv2.imshow("blob debugger", out_img)
+
+    #     return (int(left_blob[0]), int(right_blob[0]))
+
+
+
+
+
     '''
     Implement the main image processing control loop below and figure out how it fits in 
     with the high level running loop (and calling blue detector guy).
@@ -250,25 +326,174 @@ class PID_control:
         except CvBridgeError as e:
             print(e)
 
-        ### Resizing:
-        resized = cv2.resize(cv_image, (400, 400))
-        roi = resized[(resized.shape[0]*0.5):, :]  # bottom half
-        # roi = cv_image[(cv_image.shape[0]*0.5):, :]  # bottom half -> Use after making second camera
+        ### Preprocessing (grayscale, resize, blur, binary threshold)
+        resized = cv2.resize(cv_image, (0,0), fx=0.1, fy=0.1, interpolation=cv2.INTER_NEAREST) # INTER_AREA also an option
+        roi = resized[int(resized.shape[0]*0.65):, :]  # bottom 35%
         height, width = roi.shape[:2]
         image_center = width // 2
 
-        ## Preprocessing (grayscale, blur, binary threshold)
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        ## Preprocessing 
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) # Reduce bandwidth quickly
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         _, thresh = cv2.threshold(blurred, self.thresh_val, 255, cv2.THRESH_BINARY)
 
 
         # Check for colors (update state and publish cb_detector here)
-        self.cb_detector(cv_image)
-        self.scan_pink(cv_image)
+        self.cb_detector(resized)
+        self.scan_pink(roi)
 
+
+        """ Set up SimpleBlobDetector parameters. """
+        params = cv2.SimpleBlobDetector_Params()
+        params.filterByArea = True
+        params.minArea = 100    # Adjust based on resolution
+        params.maxArea = 50000  # Prevent huge noise blobs
+        params.filterByCircularity = False
+        params.filterByConvexity = False
+        params.filterByInertia = False
+        params.blobColor = 255  # Looking for white blobs in binary image
+
+        detector = cv2.SimpleBlobDetector_create(params)
+
+        # Detect blobs then sort by descending size
+        keypoints = detector.detect(thresh)
+        keypoints = sorted(keypoints, key=lambda k: k.size, reverse=True)
+
+        twist = Twist()
+
+        if len(keypoints) < 2:
+             ### EITHER ONE OR NO BLOBS FOUND, START SPINNING LIKE CRAZY AFTER A FEW FRAMES
+            if len(keypoints) == 1:
+                '''Find out where the blob is and assume that its on the correct side. Create error and trigger pid'''
+                single_blob = keypoints[0].pt
+                single_x = int(single_blob[0])
+
+                if single_x < image_center: 
+                    right_x = width - 1     
+                    left_x = single_x   # Our one blob is the left lane line
+                else:
+                    left_x = 0      
+                    right_x = single_x  # Our one blob is the right lane line
+                
+                lane_center = (left_x + right_x) // 2
+                error = image_center - lane_center
+                twist.angular.z = self.pid_control(error)
+                twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
+                rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
+
+            else:
+                rospy.logwarn("No blobs detected, PID abandoned; spinning")
+                twist.angular.z = 1.0
+                twist.linear.x = 0.0
+
+        else:
+            # Get the two largest blobs
+            left_blob = keypoints[0].pt  # (x, y)
+            right_blob = keypoints[1].pt
+
+            if abs(right_blob[0] - left_blob[0]) < width * 0.3:
+                for n in range(len(keypoints)):
+                    right_blob = keypoints[n].pt
+                    if abs(right_blob[0] - left_blob[0]) > width * 0.3:
+                        break
+                    else:
+                        right_blob = None
+                        ### If we never break then right blob is none, handle single case.
+                        
+            if right_blob is None:
+                single_blob = keypoints[0].pt
+                single_x = int(single_blob[0])
+
+                if single_x < image_center: 
+                    right_x = width - 1     
+                    left_x = single_x   # Our one blob is the left lane line
+                else:
+                    left_x = 0      
+                    right_x = single_x  # Our one blob is the right lane line
+                
+            else: 
+                blobs = (int(left_blob[0]), int(right_blob[0]))
+                left_x, right_x = sorted(blobs)
+
+            lane_center = (left_x + right_x) // 2
+            error = image_center - lane_center
+            twist.angular.z = self.pid_control(error)
+            twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
+            rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
+                
+
+
+            # Optional: draw blobs
+            out_img = cv2.drawKeypoints(thresh, keypoints[:2], None, (0, 0, 255),
+                                        cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+            cv2.imshow("blob debugger", out_img)
+            cv2.waitKey(1)
+
+        
+
+
+        
+
+
+
+
+        # blobs = self.detect_lane_blobs(thresh)
+
+        # twist = Twist()
+        # if blobs is None:
+        #     rospy.logwarn("Blob detection failed — fallback to white mean")
+        #     white_pixels = np.where(thresh > 0)
+        #     if white_pixels[1].size > 0:
+        #         road_center = int(np.mean(white_pixels[1]))
+        #         error = (thresh.shape[1] // 2) - road_center
+        #         twist.angular.z = self.pid_control(error)
+        #         twist.linear.x = self.reducedspeed
+        #     else:
+        #         twist.angular.z = 1.0
+        #         twist.linear.x = 0.0
+        # else: ### CHANGE TO ELIF
+        #     left_x, right_x = sorted(blobs)
+        #     lane_center = (left_x + right_x) // 2
+        #     image_center = thresh.shape[1] // 2
+        #     error = image_center - lane_center
+        #     twist.angular.z = self.pid_control(error)
+        #     twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
+        #     rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
+
+        
+        
+        ### If one blob, check which half of screen it is on. Assume that this is right and set error to correct to the right.
+        ### If no blobs, something fucked up. (Check intervals for expected behavior ?)
+
+
+        '''
+
+        twist = Twist()
+        the_pocket = 5 # if our error < the_pocket=5 pixels then we drive fast
+
+        # ## Attempt to FORCE fallback here:
+        white_pixels = np.where(thresh > 0)
+        if white_pixels[1].size > 0:
+            road_center = int(np.mean(white_pixels[1]))
+            error = image_center - road_center
+
+            twist.angular.z = self.pid_control(error)
+            twist.linear.x = self.maxspeed if abs(error) < the_pocket else self.reducedspeed
+            rospy.loginfo(f"Error: {error}, Angular Z: {twist.angular.z:.2f}, Linear X: {twist.linear.x:.2f}")
+
+        else:
+            twist.angular.z = 1.0
+            twist.linear.x = 0.05
+            print("No road at all we're spinning")
+
+        '''
+
+        self.pub_cmd.publish(twist)
+        
+        
         ## Scan horizontal rows:
         y_coords = [int(height * w) for w in (0.8, 0.65, 0.4)]    # Edit weights to change row heights
+        '''
         midpoints = []
 
         for y in y_coords:
@@ -287,174 +512,53 @@ class PID_control:
         if not midpoints:
             rospy.logwarn("No midpoints found, attempting fallback strategy")
             # Try fallback: if any white line exists, steer based on its avg position
-            white_pixels = np.where(binary > 0)
+            white_pixels = np.where(thresh > 0)
             if white_pixels[1].size > 0:
                 center_est = int(np.mean(white_pixels[1]))
                 error = image_center - center_est
                 twist.angular.z = self.pid_control(error)
                 twist.linear.x = self.reducedspeed
+                print(error)
             else: 
                 # No white anywhere, stop & spin
+                error = 10000 # Garbage value -- will never get thrown into pid integral term
                 twist.angular.z = 1.0
                 twist.linear.x = 0.0
         else:
-            # Midpoints is not empty:
             road_center = sum(midpoints) // len(midpoints)
 
-            ## Attempt to do fallback here:
-            white_pixels = np.where(binary > 0)
-            if white_pixels[1].size > 0:
-                road_center = int(np.mean(white_pixels[1]))
-            else:
-                road_center = image_center ### DRIVE STRAIGHT FORWARD
-                ## Idk fix this later
+            # ## Attempt to FORCE fallback here:
+            # white_pixels = np.where(thresh > 0)
+            # if white_pixels[1].size > 0:
+            #     road_center = int(np.mean(white_pixels[1]))
 
             error = image_center - road_center
             twist.angular.z = self.pid_control(error)
-            twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
+            twist.linear.x = self.maxspeed if abs(error) < 5 else self.reducedspeed
             rospy.loginfo(f"Error: {error}, Angular Z: {twist.angular.z:.2f}, Linear X: {twist.linear.x:.2f}")
-
-        self.pub_cmd.publish(twist)
-
-        # === Visual feedback ===
-        telemetry = self.maketelemetry(thresh, y_coords)
-        cv2.imshow("Telemetry", telemetry)
-        # cv2.imshow("Tuner", Tuner)
-        cv2.waitKey(1)
-
-        # cv2.imshow("blurred", blurred)
-        # cv2.imshow("thresh", thresh)
-        # cv2.imshow("gray", gray)
-        # cv2.imshow("raw", cv_image)
-        # cv2.waitKey(1)
-
-
-        ##############################################################
-
-
-        max_error = 10 # (arbitrary)
-
-        resized = cv2.resize(cv_image, (400, 400))  # Shrink incoming image size before processing
-
-        height = resized.shape[0]
-        width = resized.shape[1]
-
-        y_coord = int(height * 0.8)  # y-coord for scanning, bottom row
         
-
-        # Resize and crop region of interest (optional)
-        roi = resized[int(height * 0.5):, :]  # Bottom half of the frame
-
-        # Update dimensions (clean this up later):
-        height = roi.shape[0]
-        width = roi.shape[1]
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        _, thresh = cv2.threshold(blurred, self.thresh_val, 255, cv2.THRESH_BINARY)
-
-
-
-
-        '''
-        Check for road between lines. (do subtraction and check for )
-        
-        Telemetry is going to be pivotal here.
-
-        binary threshold everything with only very bright whites getting through and just look for a jump between indices to indicate a jump.
-
+        # self.pub_cmd.publish(twist)
         '''
 
-
-        ### For 3 y locations, find midpoints and average them. Weight the middle highest, bottom second highest, and top third highest.
-
-        y_coords = [(int(height*0.8)), (int(height*0.65)), (int(height*0.4))]
-
-        # mp_weights = [0.35, 0.45, 0.20]        # Weights sum to 1.0 jk dont do this
-        midpoints = []
-
-        for n in range(len(y_coords)):
-            lanelines = []
-            scan_row = thresh[y_coords[n], :]
-            for i in range(len(scan_row)):
-                if (scan_row[i] == 255):
-                    lanelines.append(i)
-
-            min_check = 50 # Num pixels between white lines detected (minimum 500?)
-            for i in range(len(lanelines)-1):
-                if (lanelines[i+1] - lanelines[i] > min_check):     # Confirm that this only occurs once?
-                    left = lanelines[i] + 1
-                    right = lanelines[i+1] - 1
-                    # TODO: Fix this it is so wrong -- this is just for initial git push.
-                    midpoints.append((left + right // 2))
-
-                    # Edge cases,   we read that the gap is sufficient but it's misreading (i.e. crosswalk)
-                    #               left white line is off the page, 
-                    #               the above case but we detect a fleck and it gets confused. (Contour detection and filter that way?)
-                    #               It sees more than 2 lines and gets overwritten. (Integral term gets bad?)
-                    #               Any of these could get really bad in the second section.
-                    #               Signs would confuse it.
-                    # Arguments for leaving this:
-                    #   If it misreads only one frame, it may just correct next frame.
-                    # Arguments against: Most of these edge cases aren't just for one frame.
-   
-        twist = Twist()
-        image_center = width // 2
-        
-        # IDEALLY THIS IF STATEMENT IS NEVER TRUE
-        if (len(midpoints) == 0):
-            # print("Midpoints not found, spinning CCW")
-            # twist.linear.x = 0.0
-            # twist.angular.z = 3.0  # Spin until road is found
-            # TODO: Change this so we check derivative error and spin the right way.
-
-            # if((lanelines[-1] - lanelines[0]) > image_center):
-            #     error = ((lanelines[0] + lanelines[-1]) // 2) - imagecenter
-            if (len(lanelines) > 0):
-                print("Midpoints not found, choosing line")
-                error = image_center - ((lanelines[0] + lanelines[-1]) // 2)
-                # Check that the sign is right on this
-                    
-                # Apply PID
-                twist.angular.z = self.pid_control(error)
-                twist.linear.x = self.reducedspeed # Doubly reduced
-            else:
-                print("No lines detected anywhere, spinning")
-                twist.angular.z = 1.0
-                twist.linear.x = -0.05 # maybe make zero
-
-
-            # read first and last vals in lanelines, if theyre x pix wide and 10 < x < 50 pix, 
-            # treat it as a lane line and set road center left.
-
-            '''
-            Add a check for the case where we actually just lost the line. Drive backwards? or spin?
-            '''
-        else:
-            road_center = sum(midpoints) // len(midpoints)
-            error = image_center - road_center  # error value for PID
-
-            # Apply PID
-            twist.angular.z = self.pid_control(error)
-            twist.linear.x = self.maxspeed if (error < max_error) else self.reducedspeed    # Max speed decreases if error exceeds some value.
-
-            print(f"Error: {error}, Angular Z: {twist.angular.z}, Linear X: {twist.linear.x}")
-        
-        self.pub_cmd.publish(twist)
-
- 
-
+        '''
+        Figure out additional object detection and secondary state-based control flow algorithms here:
+        '''
         # if (state == 0):
             # TODO: look for crosswalk and switch to motion-detection mode. (Stop until safe)
             # Also figure out this control algorithm for the  
 
-        ### Telemetry and GUI stuff:
-        telemetry = self.maketelemetry(thresh, y_coords)
 
-        cv2.imshow("Telemetry", telemetry)
+        # === Visualized Feedback ===
+        telemetry = self.maketelemetry(thresh, y_coords)
+        # cv2.imshow("Telemetry", telemetry)
+        # cv2.imshow("raw", cv_image)
+        # cv2.imshow("gray", gray)
+        # cv2.imshow("blurred", blurred)
+        # cv2.imshow("thresh", thresh)    # This gives us road values -> doesn't 
+        ''' Can also show blobs and color masks in respective helper functions. '''
         cv2.waitKey(1)
-        
+
+        '''Save PID coeffs here (but don't use this yet)'''
         # key = cv2.waitKey(1) & 0xFF
         # if key == ord('s'):
         #     self.save_settings()
@@ -465,12 +569,9 @@ if __name__ == '__main__':
     Drive = PID_control()
     rate = rospy.Rate(30)  # 30 Hz -- 30 fps but not necessarily
 
-    # Rospy spinning shenanigans? 
-    #    - Only if we can end it once the mountain sign is read.
-
     while not rospy.is_shutdown():
         try:
-            data = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=5) # Is path correct?
+            data = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=5) # Path should be correct
             Drive.process_image(data)
         except rospy.ROSException:
             # pass
