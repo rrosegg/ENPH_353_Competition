@@ -63,8 +63,10 @@ class ClueBoardDetector:
             return
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_blue = np.array([110, 200, 50])
-        upper_blue = np.array([135, 255, 220])
+        # lower_blue = np.array([110, 200, 50]) # original
+        lower_blue = np.array([100, 70, 50]) # Jackson's
+        # upper_blue = np.array([135, 255, 255]) # original
+        upper_blue = np.array([250, 255, 220]) # Jackson's
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
         self.mask_pub.publish(self.bridge.cv2_to_imgmsg(mask, encoding="mono8"))
