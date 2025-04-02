@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
-import torch
+import os
 
 import csv
 import random
@@ -18,6 +18,7 @@ from PIL import Image as PILImage
 from PIL import ImageFont, ImageDraw
 from sklearn.cluster import KMeans
 from collections import Counter
+from tensorflow.keras.models import load_model
 
 NUM_FRAMES = 5
 frame_clue_predictions = []
@@ -29,19 +30,27 @@ class ClueBoardDetector:
     def __init__(self):
         rospy.init_node("clue_board_detector", anonymous=True)
         self.bridge = CvBridge()
-        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ok_callback is used
+        # self.image_sub = None  # Defer image sub until "ok"
+        # self.start_sub = rospy.Subscriber("/start_signal", String, self.ok_callback)
 
         self.mask_pub = rospy.Publisher('/masked_feed', Image, queue_size=1)
         self.inverted_pub = rospy.Publisher('/inverted_feed', Image, queue_size=1)
         self.contour_pub = rospy.Publisher('/contoured_feed', Image, queue_size=1)
         self.projected_cb_pub = rospy.Publisher('/projected_cb_feed', Image, queue_size=1)
 
-        self.model = CharNNModel()  # implement separately
-        self.model.load_state_dict(torch.load(
-            "/ros_ws/src/my_controller/models/charNNModel.pth",
-            map_location=torch.device('cpu')
-        ))
-        self.model.eval()
+        self.inverted_projected_pub = rospy.Publisher('/inverted_projected_feed', Image, queue_size=1)
+        self.charbox_pub = rospy.Publisher('/charbox_feed', Image, queue_size=1)
+
+        self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.h5")
+
+
+        # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
+
+    # def ok_callback(self, msg):
+    #     if msg.data.lower() == "ok" and self.image_sub is None:
+    #         rospy.loginfo("Start signal received. Beginning clueboard processing.")
+    #         self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
 
     def image_callback(self, msg):
         width, height = 600, 400
@@ -61,11 +70,13 @@ class ClueBoardDetector:
         self.mask_pub.publish(self.bridge.cv2_to_imgmsg(mask, encoding="mono8"))
 
         inverted = cv2.bitwise_not(mask)
+        self.inverted_pub.publish(self.bridge.cv2_to_imgmsg(inverted, encoding="mono8"))
+
         edged = cv2.Canny(inverted, 30, 255)
 
         contours, _ = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        min_area = float('inf')
+        max_area = 0
         inner_contour = None
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -73,13 +84,16 @@ class ClueBoardDetector:
                 continue
             epsilon = 0.02 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
-            if len(approx) == 4 and area < min_area:
-                min_area = area
+            if len(approx) == 4 and area > max_area:
+                max_area = area
                 inner_contour = approx
 
         contour_feed = cv2.cvtColor(edged.copy(), cv2.COLOR_GRAY2BGR)
+
         if inner_contour is not None:
             cv2.drawContours(contour_feed, [inner_contour], -1, (0, 255, 0), 3)
+            for pt in inner_contour:
+                cv2.circle(contour_feed, tuple(pt[0]), 5, (0, 0, 255), -1)
             self.contour_pub.publish(self.bridge.cv2_to_imgmsg(contour_feed, encoding="bgr8"))
 
         dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype='float32')
@@ -87,39 +101,73 @@ class ClueBoardDetector:
         M = cv2.getPerspectiveTransform(src, dst)
         projected = cv2.warpPerspective(frame, M, (width, height))
 
+        self.projected_cb_pub.publish(self.bridge.cv2_to_imgmsg(projected, encoding="bgr8"))
+
         hsv_projected = cv2.cvtColor(projected, cv2.COLOR_BGR2HSV)
         lower_blue_projected = np.array([110, 100, 50])
         mask_projected = cv2.inRange(hsv_projected, lower_blue_projected, upper_blue)
         inverted_projected = cv2.bitwise_not(mask_projected)
-        self.inverted_pub.publish(self.bridge.cv2_to_imgmsg(inverted_projected, encoding="mono8"))
+        self.inverted_projected_pub.publish(self.bridge.cv2_to_imgmsg(inverted_projected, encoding="mono8"))
 
         # --- Character segmentation ---
         contours, _ = cv2.findContours(inverted_projected, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        word_boxes = []
+        # --- Initial filter based on size ---
+        raw_boxes = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
             if 15 < w < 100 and 30 < h < 100:
-                word_boxes.append((x, y, w, h))
+                raw_boxes.append((x, y, w, h, area))
 
-        if len(word_boxes) == 0:
-            raise ValueError("No valid character boxes detected. Try adjusting contour filters.")
+        # Sort boxes by area descending (bigger ones first)
+        raw_boxes = sorted(raw_boxes, key=lambda b: b[4], reverse=True)
 
+        final_boxes = []
+        for candidate in raw_boxes:
+            if all(not boxes_overlap(candidate, kept) for kept in final_boxes):
+                final_boxes.append(candidate)
+
+        # Strip area field after filtering
+        word_boxes = [(x, y, w, h) for (x, y, w, h, _) in final_boxes]
+
+        # --- Cluster boxes into top and bottom rows using KMeans ---
         y_centers = np.array([[y + h // 2] for (_, y, _, h) in word_boxes])
         kmeans = KMeans(n_clusters=2, random_state=0).fit(y_centers)
         labels = kmeans.labels_
 
-        clue_boxes = [box for box, label in zip(word_boxes, labels) if label == 0]
-        value_boxes = [box for box, label in zip(word_boxes, labels) if label == 1]
+        top_boxes = [box for box, label in zip(word_boxes, labels) if label == 0]
+        bottom_boxes = [box for box, label in zip(word_boxes, labels) if label == 1]
 
-        clue_crops = get_letter_crops(clue_boxes, width, height, inverted_projected)
-        value_crops = get_letter_crops(value_boxes, width, height, inverted_projected)
+        # Ensure top is actually above bottom
+        if np.mean([y for (_, y, _, _) in top_boxes]) > np.mean([y for (_, y, _, _) in bottom_boxes]):
+            top_boxes, bottom_boxes = bottom_boxes, top_boxes
+        
+        top_boxes = sorted(top_boxes, key=lambda b: b[0])
+        bottom_boxes = sorted(bottom_boxes, key=lambda b: b[0])
+        
+        # clue_boxes = [box for box, label in zip(word_boxes, labels) if label == 0]
+        # value_boxes = [box for box, label in zip(word_boxes, labels) if label == 1]
+
+        vis_char = cv2.cvtColor(inverted_projected.copy(), cv2.COLOR_GRAY2BGR)
+
+        for (x, y, w, h) in top_boxes:
+            cv2.rectangle(vis_char, (x, y), (x + w, y + h), (0, 255, 0), 2)  # green for clue
+
+        for (x, y, w, h) in bottom_boxes:
+            cv2.rectangle(vis_char, (x, y), (x + w, y + h), (255, 0, 0), 2)  # blue for value
+
+        self.charbox_pub.publish(self.bridge.cv2_to_imgmsg(vis_char, encoding="bgr8"))
+
+
+        clue_crops = get_letter_crops(top_boxes, width, height, inverted_projected)
+        value_crops = get_letter_crops(bottom_boxes, width, height, inverted_projected)
 
         clue_nn_input = prepare_for_nn(clue_crops)
         value_nn_input = prepare_for_nn(value_crops)
 
-        clue_predictions = self.model(clue_nn_input)
-        value_predictions = self.model(value_nn_input)
+        clue_predictions = self.model.predict(clue_nn_input)
+        value_predictions = self.model.predict(value_nn_input)
 
         clue_chars = decode_predictions(clue_predictions, class_names)
         value_chars = decode_predictions(value_predictions, class_names)
@@ -127,18 +175,9 @@ class ClueBoardDetector:
         frame_clue_predictions.append(clue_chars)
         frame_value_predictions.append(value_chars)
 
-        value_boxes = sorted(value_boxes, key=lambda b: b[0])
-        space_indices = []
-        for i in range(1, len(value_boxes)):
-            prev_x, _, prev_w, _ = value_boxes[i - 1]
-            curr_x, _, _, _ = value_boxes[i]
-            gap = curr_x - (prev_x + prev_w)
-            if gap > 20:
-                space_indices.append(i)
-
         if len(frame_clue_predictions) >= NUM_FRAMES:
             clue_result = vote_across_frames(frame_clue_predictions)
-            value_result = vote_across_frames(frame_value_predictions, space_indices)
+            value_result = vote_across_frames(frame_value_predictions)
 
             rospy.loginfo(f"Clue Type:  {clue_result}")
             rospy.loginfo(f"Clue Value: {value_result}")
@@ -172,40 +211,54 @@ def get_letter_crops(boxes, width, height, img):
             print(f"Skipping empty crop at index {i}")
             continue
 
-        resized = cv2.resize(letter, (54, 80))
+        resized = cv2.resize(letter, (32, 32))
         letter_crops.append(resized)
     return letter_crops
 
+# --- Remove nested/overlapping boxes ---
+def boxes_overlap(box1, box2, threshold=0.5):
+    x1, y1, w1, h1, _ = box1
+    x2, y2, w2, h2, _ = box2
+
+    # Calculate overlap
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+    inter_width = max(0, xi2 - xi1)
+    inter_height = max(0, yi2 - yi1)
+    inter_area = inter_width * inter_height
+
+    if inter_area == 0:
+        return False
+
+    # Overlap ratio with respect to smaller box
+    smaller_area = min(w1 * h1, w2 * h2)
+    return inter_area / smaller_area > threshold
 
 def prepare_for_nn(crops):
-    tensor_batch = torch.stack([
-        torch.tensor(crop, dtype=torch.float32).unsqueeze(0) / 255.0
-        for crop in crops
-    ])
-    return tensor_batch
+    valid = []
+    for i, crop in enumerate(crops):
+        if crop.shape != (32, 32):
+            rospy.logwarn(f"Skipping invalid crop at index {i} with shape {crop.shape}")
+            continue
+        valid.append(crop)
 
+    crops = np.array(valid).astype("float32") / 255.0
+    return crops.reshape(-1, 32, 32, 1)
 
 def decode_predictions(predictions, class_names):
-    predicted_indices = torch.argmax(predictions, dim=1)
+    predicted_indices = np.argmax(predictions, axis=1)
     return [class_names[i] for i in predicted_indices]
 
 
-def vote_across_frames(pred_lists, space_indices=None):
+def vote_across_frames(pred_lists):
     final_chars = []
     for i in range(len(pred_lists[0])):
         chars = [frame[i] for frame in pred_lists if len(frame) > i]
         vote = Counter(chars).most_common(1)[0][0]
         final_chars.append(vote)
-
-    if space_indices:
-        output = ""
-        for i, char in enumerate(final_chars):
-            if i in space_indices:
-                output += " "
-            output += char
-        return output
-    else:
-        return "".join(final_chars)
+    return "".join(final_chars)
 
 
 def start_controller():
