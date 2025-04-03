@@ -31,16 +31,18 @@ class ClueBoardDetector:
         rospy.init_node("clue_board_detector", anonymous=True)
         self.published_clues = set()
         self.bridge = CvBridge()
-        # self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
-        # # self.image_sub = None  # Defer image sub until "yes"
-        # ## self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
+        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
+        # self.image_sub = None  # Defer image sub until "yes"
+        #self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
 
-        # # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
+        # # # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
 
-        self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
-        self.ready = False
+        # self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
+        # self.ready = False
+        # self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
+
+        self.image_sub = None
         self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
-
         self.mask_pub = rospy.Publisher('/masked_feed', Image, queue_size=1)
         self.inverted_pub = rospy.Publisher('/inverted_feed', Image, queue_size=1)
         self.contour_pub = rospy.Publisher('/contoured_feed', Image, queue_size=1)
@@ -54,21 +56,22 @@ class ClueBoardDetector:
 
         self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
 
+        rospy.sleep(1)
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
 
-    # def ready_callback(self, msg):
-    #     if msg.data.lower() == "yes" and self.image_sub is None:
-    #         rospy.loginfo("Start signal received. Beginning clueboard processing.")
-    #         self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
-
     def ready_callback(self, msg):
-        if msg.data.lower() == "yes":
-            rospy.loginfo("Start signal received. Processing enabled.")
-            self.ready = True
+        if msg.data.lower() == 'yes' and self.image_sub is None:
+            rospy.loginfo("Start signal received. Beginning clueboard processing.")
+            self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
+
+    # def ready_callback(self, msg):
+    #     if msg.data.lower() == "yes":
+    #         rospy.loginfo("Start signal received. Processing enabled.")
+    #         self.ready = True
 
     def image_callback(self, msg):
-        if not self.ready:
-            return
+        # if not self.ready:
+        #     return
         width, height = 600, 400
         rospy.loginfo("Received Image")
 
@@ -151,6 +154,10 @@ class ClueBoardDetector:
         # Strip area field after filtering
         word_boxes = [(x, y, w, h) for (x, y, w, h, _) in final_boxes]
 
+        if len(word_boxes) < 2:
+            rospy.logwarn("Not enough word boxes to perform KMeans clustering.")
+            return
+
         # --- Cluster boxes into top and bottom rows using KMeans ---
         y_centers = np.array([[y + h // 2] for (_, y, _, h) in word_boxes])
         kmeans = KMeans(n_clusters=2, random_state=0).fit(y_centers)
@@ -210,31 +217,31 @@ class ClueBoardDetector:
 
             confirmed_clue_result = fuzzy_clue if fuzzy_clue else clue_result
 
-            if confirmed_clue_result not in self.published_clues:
-                self.published_clues.add(confirmed_clue_result)
+            # if confirmed_clue_result not in self.published_clues:
+            #     self.published_clues.add(confirmed_clue_result)
 
-                team_id = "Egg"
-                password = "pw"
-                clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
-                clue_prediction = value_result
-                rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
-                rospy.loginfo(f"Clue Type:  {clue_result}")
-                rospy.loginfo(f"Clue Value: {value_result}")
-                msg = f"{team_id},{password},{clue_location},{clue_prediction}"
-                self.pub_score.publish(msg)
-            else:
-                rospy.loginfo(f"Already published clue for {confirmed_clue_result}, skipping.")
+            #     team_id = "Egg"
+            #     password = "pw"
+            #     clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
+            #     clue_prediction = value_result
+            #     rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
+            #     rospy.loginfo(f"Clue Type:  {clue_result}")
+            #     rospy.loginfo(f"Clue Value: {value_result}")
+            #     msg = f"{team_id},{password},{clue_location},{clue_prediction}"
+            #     self.pub_score.publish(msg)
+            # else:
+            #     rospy.loginfo(f"Already published clue for {confirmed_clue_result}, skipping.")
 
-            # team_id = "Egg"
-            # password = "pw"
-            # clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
-            # clue_prediction = value_result
-            # rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
-            # rospy.loginfo(f"Clue Type:  {clue_result}")
-            # rospy.loginfo(f"Clue Value: {value_result}")
-            # msg = f"{team_id},{password},{clue_location},{clue_prediction}"
-            # self.pub_score.publish(msg)
-            # # self.finish_sub.publish("read")
+            team_id = "Egg"
+            password = "pw"
+            clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
+            clue_prediction = value_result
+            rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
+            rospy.loginfo(f"Clue Type:  {clue_result}")
+            rospy.loginfo(f"Clue Value: {value_result}")
+            msg = f"{team_id},{password},{clue_location},{clue_prediction}"
+            self.pub_score.publish(msg)
+            # self.finish_sub.publish("read")
 
             frame_clue_predictions.clear()
             frame_value_predictions.clear()
