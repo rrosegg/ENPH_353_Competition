@@ -62,14 +62,13 @@ class PID_control:
         self.pub_cmd = rospy.Publisher('/B1/cmd_vel', Twist, queue_size=1)
         self.pub_cb_detected = rospy.Publisher('/cb_detected', String, queue_size=1)
         self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
-        ''' Remove the image subscriber initialization here, it's causing issues.'''
-        # self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.process_image) # Make this Low-Res
-        # Is the correct path to the above actually this? "/B1/rrbot/camera1/image_raw" -- no hell nah
-        # Old path: /robot/camera1/image_raw
+        self.cb_read_sub = rospy.Subscriber('cb_read', String, queue_size=1)
         self.bridge = CvBridge()
 
         # Wait for connection to publishers
         rospy.sleep(1.0) # 0.5?
+
+        self.pub_score.publish('Egg,pw,0,NA') #TODO send -1 when comp is done.
 
         # PID Control Parameters
         self.Kp = 0.10     # Proportional gain  
@@ -94,10 +93,8 @@ class PID_control:
         self.params.filterByArea = True
         # self.params.minArea = 200    # Adjust based on resolution   (Used to be 100, then 50)
         # self.params.maxArea = 20000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
-
         self.params.minArea = 200
         self.params.maxArea = 200000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
-
         self.params.filterByCircularity = False
         self.params.filterByConvexity = False
         self.params.filterByInertia = False ## True??
@@ -116,6 +113,8 @@ class PID_control:
         self.fcount = 0 # Only look for colors every 5th frame
         self.look_more = False ### TODO: Find a use for this
 
+        self.min_cb_area = 15000 #TODO: TUNE THIS
+
 
         self.motion_threshold = 100 
 
@@ -128,7 +127,7 @@ class PID_control:
         # Debugging params
         self.lasttime = time.time()
         self.show_time = True
-        self.debug = True
+        self.debug = False
         self.autopilot = 1  # 1 for on, 0 for off
 
         '''
@@ -200,10 +199,40 @@ class PID_control:
 
     # Scan for blue and publish to cb_detected
     def cb_detector(self, cv_image):
-        min_blue = 50 # At least 200 bluepix to trigger "cb detected -> yes"
-        bluepix = self.count_colorpix(cv_image, "blue")
-        cb_detected = 'yes' if (bluepix > min_blue) else 'no'
+        # min_blue = 50 # At least 200 bluepix to trigger "cb detected -> yes"
+        # bluepix = self.count_colorpix(cv_image, "blue")
+        # cb_detected = 'yes' if (bluepix > min_blue) else 'no'
+        # self.pub_cb_detected.publish(cb_detected)
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        lower_blue, upper_blue = np.array([100, 70, 50]), np.array([250, 255, 220]) # Jackson's (empirical)
+        # lower_blue, upper_blue = np.array([110, 200, 50]), np.array([135, 255, 255]) # original
+
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        inverted = cv2.bitwise_not(mask)
+        edged = cv2.Canny(inverted, 30, 255)
+        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        max_area = 0
+        inner_contour = None
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 1000: continue
+            epsilon = 0.02 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            if len(approx) == 4 and area > max_area:
+                max_area = area
+                inner_contour = approx
+            
+        if inner_contour is not None and max_area > self.min_cb_area:
+            rospy.loginfo("CB Visible, giving the ok to cb_reader node")
+            cb_detected = 'yes'
+        else: 
+            cb_detected = 'no'
         self.pub_cb_detected.publish(cb_detected)
+
+
+
 
     def scan_red(self, cv_image):
         # Make a box or something if detected?
@@ -222,7 +251,7 @@ class PID_control:
                 # We're looking for the second truck I presume.
                 pass
 
-
+    '''TODO: Patch this'''
     def motion_detector(self):
         try:
             prev_img = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=1.0)
@@ -268,8 +297,6 @@ class PID_control:
                     time.sleep(1)
 
         # THEN EXECUTE WHATEVER CODE AFTER!
-        
-
 
 
     def scan_pink(self, roi):
@@ -383,8 +410,8 @@ class PID_control:
         self.pub_cmd.publish(routine)
         rospy.sleep(1)
 
-        routine.linear.x = 0.5
-        routine.angular.z = 0.2
+        routine.linear.x = 3.0
+        routine.angular.z = 0.1
         self.pub_cmd.publish(routine)
         rospy.sleep(1)
 
@@ -501,7 +528,7 @@ class PID_control:
 
         # Check for colors (update state and publish cb_detector here)
 
-        self.cb_detector(resized)
+        self.cb_detector(cv_image)
         self.scan_pink(roi)
         # self.count_colorpix(roi, "red")
 

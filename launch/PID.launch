@@ -4,6 +4,12 @@
             name="PID" 
             output="screen">
     </node>
+    <node pkg="my_controller"
+            type="clueboard_reader.py"
+            name="clueboard_reader" 
+            output="screen">
+    </node>
+
 
     <!-- <include file="$(find enph353_utils)/launch/sim.launch"/> -->
 </launch>
