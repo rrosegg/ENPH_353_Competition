@@ -35,18 +35,21 @@ After reading the final sign, we publish the clue and stop driving.
 class PID_control:
 
     # Define drive states
-    STATE_PAVED    = 0
-    STATE_UNPAVED  = 1
-    STATE_OFFROAD  = 2
-    STATE_MOUNTAIN = 3
+    STATE_PAVED     = 0
+    STATE_UNPAVED   = 1
+    STATE_OFFROAD   = 2
+    STATE_MOUNTAIN  = 3
 
     # State machine steps!
-    AVOID_YODA     = 444
-    CP_ICE_SLICK   = 5
-    CHILLIN        = 6
-    PED_XING    = 7   # dont hit pedestrian.
-    TRUCK_STOP     = 8 # wait for the truck then go.
-    DONT_SWIM      = 9 # find long path and send it
+    PED_XING        = 1   # dont hit pedestrian.
+    TRUCK_STOP      = 2 # wait for the truck then go.
+    POST_TRUCK_CLARITY = 3
+    MOUNTAINEERING  = 4
+    DONT_SWIM       = 9 # find long path and send it    
+    CP_ICE_SLICK    = 5
+    AVOID_YODA      = 444
+    CHILLIN         = 6
+
 
     FCHECK_INTERVAL = 4
 
@@ -65,13 +68,16 @@ class PID_control:
         # Old path: /robot/camera1/image_raw
         self.bridge = CvBridge()
 
+        # Wait for connection to publishers
+        rospy.sleep(1.0) # 0.5?
+
         # PID Control Parameters
         self.Kp = 0.10     # Proportional gain  
         self.Ki = 0.0    # Integral gain  ---- 0.001
         self.Kd = 0.02     # Derivative gain  ---- 0.002
         self.prev_error = 0
         self.integral = 0
-        self.integral_cap = 100
+        self.integral_cap = 0.5 # Down from 100
 
         # Speed Limits
         self.maxspeed = 0.0 # 2.0-1.0 works
@@ -86,30 +92,43 @@ class PID_control:
         """ Set up SimpleBlobDetector parameters. """
         self.params = cv2.SimpleBlobDetector_Params()
         self.params.filterByArea = True
-        self.params.minArea = 200    # Adjust based on resolution   (Used to be 100, then 50)
-        self.params.maxArea = 20000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
+        # self.params.minArea = 200    # Adjust based on resolution   (Used to be 100, then 50)
+        # self.params.maxArea = 20000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
+
+        self.params.minArea = 200
+        self.params.maxArea = 200000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
+
         self.params.filterByCircularity = False
         self.params.filterByConvexity = False
         self.params.filterByInertia = False ## True??
         self.params.blobColor = 255  # Looking for white blobs in binary image
 
+        # STATE MACHINE
+        self.sm = self.PED_XING
+
+
         # Lane detection / Road stuff
         self.pinkpix = 0 # Number of pink pixels seen in the frame
         self.consec_pink_frames = 0
         self.consec_pinkless = 0
+        self.big_pink_seen = False
+
         self.fcount = 0 # Only look for colors every 5th frame
+        self.look_more = False ### TODO: Find a use for this
+
+
+        self.motion_threshold = 100 
 
         # Misc
         self.lastpix = 0 # For use in road detection 
         
-        # Wait for connection to publishers
-        rospy.sleep(1.0) # 0.5?
+        
 
 
         # Debugging params
         self.lasttime = time.time()
         self.show_time = True
-        self.debug = False
+        self.debug = True
         self.autopilot = 1  # 1 for on, 0 for off
 
         '''
@@ -181,38 +200,109 @@ class PID_control:
 
     # Scan for blue and publish to cb_detected
     def cb_detector(self, cv_image):
-        min_blue = 200 # At least 200 bluepix to trigger "cb detected -> yes"
+        min_blue = 50 # At least 200 bluepix to trigger "cb detected -> yes"
         bluepix = self.count_colorpix(cv_image, "blue")
         cb_detected = 'yes' if (bluepix > min_blue) else 'no'
         self.pub_cb_detected.publish(cb_detected)
+
+    def scan_red(self, cv_image):
+        # Make a box or something if detected?
+        current_red = self.count_colorpix(cv_image, "red")
+        if current_red > 10: 
+            self.red_seen = True
+            #ONCE N PIXELS DETECTED, ALIGN WITH RED LINE AWAY FROM BOTTOM
+            # SWITCH INTO OBSERVING STATE FOR EXTREME MOTION
+            ## ONCE NO MOTION DETECTED (flag for y or n) then rip it at crosswalk
+
+            if(current_red > 100 and self.sm == PED_XING): # ???
+                # TODO: bounceback function
+                self.motion_detector()
+                self.sm += 1 # TRUCK_STOP
+            else:
+                # We're looking for the second truck I presume.
+                pass
+
+
+    def motion_detector(self):
+        try:
+            prev_img = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=1.0)
+            prev = self.bridge.imgmsg_to_cv2(prev_img, "bgr8")
+
+        except CvBridgeError as e:
+            print(e)
+
+        prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+
+        waiting = True
+        
+        while waiting:
+            try:
+                img = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=1.0)
+                now = self.bridge.imgmsg_to_cv2(prev_img, "bgr8")
+            except CvBridgeError as e:
+                print(e)
+            
+            gray = cv2.cvtColor(now, cv2.COLOR_BGR2GRAY)
+            diff = cv2.absdiff(prev_gray, gray) # Compute absolute difference between current and previous frame
+            _, motion_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY) # Threshold the difference to get motion areas
+
+            # Optional: Dilate to fill gaps
+            motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+
+            # Show motion mask
+            # if self.debug: cv2.imshow("Motion", motion_mask)
+
+            # Update previous frame
+            prev_gray = gray.copy()
+            white_pixels = np.count_nonzero(motion_mask)
+
+            if (self.sm == self.PED_XING):
+                if white_pixels == 0: waiting = False
+            else:
+                ### ASSUME YODA AND CAR????
+                if white_pixels > self.motion_threshold:
+                    waiting = False
+                    time.sleep(3)
+                elif white_pixels < 10:
+                    waiting = False
+                    time.sleep(1)
+
+        # THEN EXECUTE WHATEVER CODE AFTER!
+        
+
+
 
     def scan_pink(self, roi):
         '''Existing code could potentially double update:'''
         current_pink = self.count_colorpix(roi, "pink")
 
         if current_pink > 0:
-            self.consec_pink_frames += 1
-            # self.consec_pinkless = 0
+            if current_pink > 100: 
+                self.consec_pink_frames += 1
+                self.big_pink_seen = True
+            self.look_more = True
+            self.consec_pinkless = 0 # Comment this out?
         else:
-            if (self.consec_pink_frames > 10):
+            if (self.consec_pink_frames > 3):
                 self.state += 1
                 self.update_state()    
-                print("STATE UPDATED: NOW IN STATE ", self.state)
+                print(f"STATE UPDATED: NOW IN STATE {self.state}")
 
             self.consec_pink_frames = 0
-            # self.consec_pinkless += 1
+            self.consec_pinkless += 1
+            if self.consec_pinkless > 1: self.big_pink_seen = False # Stop checking every second
 
-        self.pinkpix = current_pink # Update at the end.
+        self.pinkpix = current_pink # Update at the end. CURRENTLY UNUSED, CHANGE THIS TO USE IT
 
     def update_state(self):
         # Update internal params based on current terrain state
         if self.state == self.STATE_PAVED:
             rospy.loginfo("Switched to: PAVED")
-            self.Kp = 0.10
-            self.Ki = 0.0 # 0.001
-            self.Kd = 0.02 # 0.002
+            self.Kp = 0.13
+            self.Ki = 0.005 # 0.001
+            self.Kd = 0.10 # 0.002 -> 0.02
             self.thresh_val = 240
-            self.maxspeed = 2.0 # 1.5
+            self.maxspeed = 2.2 # 1.5
             self.reducedspeed = 1.0 # 0.5
             self.obj_detection = True
 
@@ -246,6 +336,12 @@ class PID_control:
             rospy.logwarn(f"Unknown state: {self.state}")
 
 
+        stop = Twist()
+        stop.linear.x = 0.0
+        stop.angular.z = 0.0
+        self.pub_cmd.publish(stop)
+
+
         if self.debug:
             cv2.setTrackbarPos("Kp x1000", "Tuner", int(self.Kp * 1000))
             cv2.setTrackbarPos("Ki x1000", "Tuner", int(self.Ki * 1000))
@@ -259,8 +355,43 @@ class PID_control:
 
             
 
-    def handle_offroad(self):
-        pass
+    def handle_offroad(self): 
+        '''Hard coded routine'''
+        stop = Twist()
+        stop.linear.x = 0.0
+        stop.angular.z = 0.0
+        self.pub_cmd.publish(stop)
+        
+        routine = Twist()
+        routine.linear.x = 0.5
+        routine.angular.z = 0.7
+
+        self.motion_detector() # Wait and be in loop
+        #If no motion detected, send it? Or if some then wait and then send after hardcoded # of secs.
+
+        # Exited loop, good to go.
+        self.pub_cmd.publish(routine)
+        rospy.sleep(1)
+
+        routine.linear.x = 3.0
+        routine.angular.z = 0.0
+        self.pub_cmd.publish(routine)
+        rospy.sleep(1)
+
+        routine.linear.x = 1.0
+        routine.angular.z = -0.5
+        self.pub_cmd.publish(routine)
+        rospy.sleep(1)
+
+        routine.linear.x = 0.5
+        routine.angular.z = 0.2
+        self.pub_cmd.publish(routine)
+        rospy.sleep(1)
+
+
+
+
+
         ''' Avoid baby yoda at all costs. '''
 
 
@@ -357,7 +488,7 @@ class PID_control:
             print(e)
 
         ### Preprocessing (grayscale, resize, blur, binary threshold)
-        resized = cv2.resize(cv_image, (0,0), fx=0.1, fy=0.1, interpolation=cv2.INTER_NEAREST) # INTER_AREA also an option
+        resized = cv2.resize(cv_image, (0,0), fx=0.4, fy=0.4, interpolation=cv2.INTER_NEAREST) # INTER_AREA also an option
         roi = resized[int(resized.shape[0]*0.6):, :]  # bottom 40%
         height, width = roi.shape[:2]
         image_center = width // 2
@@ -369,6 +500,12 @@ class PID_control:
 
 
         # Check for colors (update state and publish cb_detector here)
+
+        self.cb_detector(resized)
+        self.scan_pink(roi)
+        # self.count_colorpix(roi, "red")
+
+        '''
         self.fcount +=1
         if self.fcount > self.FCHECK_INTERVAL:
             # self.cb_detector(resized)
@@ -376,7 +513,43 @@ class PID_control:
             # self.count_colorpix(roi, "red")
             # self.scan_red ????
             # self.truckchecker ???
+            
+            if(self.sm == self.PED_XING):
+                self.scan_red(roi)
+                self.cb_detector(resized)
+            elif(self.sm == self.TRUCK_STOP):
+                pass
+                # self.motion_detection(resized) #TODO: Add motion_detection function
+                ## Listen for pub command to thing?
+            elif(self.sm == self.POST_TRUCK_CLARITY):
+                self.scan_pink(roi)
+                self.cb_detector(resized) #TODO this is going to be awfully computationally intensive.
+        '''
+        '''
+            elif(self.sm == self.AVOID_YODA):
+                
+                self.scan_red(resized) #TODO FIND THE TRUCK ???
+                self
+            # elif(self.sm == AVOID_YODA):
+            #     self.hardcode_heaven(resized)       # TODO: Make this and make it blocking
+            # elif(self.sm == TUNNEL_FUN):
+            #     self.blastaway()
+             # TODO sort of lost the plot there, come back to this.
+        '''
+
+        '''
+            elif(self.sm == MOUNTAINEERING):
+                self.luminosity(roi) #TODO also check more. 
+
             self.fcount = 0
+        '''
+
+
+        # if self.big_pink_seen: scan_pink() # Start spamming it if we see it lots.
+        '''
+        If cb_detector finds a sign, it just sends a signal to thing that it's okay to look. If it doesnt find a sign, it will send "no"
+        '''
+
 
         detector = cv2.SimpleBlobDetector_create(self.params)
 
