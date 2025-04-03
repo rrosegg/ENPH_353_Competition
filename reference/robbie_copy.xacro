@@ -237,7 +237,7 @@
   <!-- ADD THIS  -->
   <gazebo reference="camera_link">
     <sensor type="camera" name="high_res_camera">
-      <update_rate>15.0</update_rate>
+      <update_rate>60.0</update_rate>
       <camera name="head">
         <!-- FOV check that it is okay -->
         <horizontal_fov>1.3962634</horizontal_fov>
@@ -260,13 +260,13 @@
           <stddev>0.007</stddev>
         </noise>
       </camera>
-      <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+      <plugin name="high_res_camera_controller" filename="libgazebo_ros_camera.so">
         <alwaysOn>true</alwaysOn>
         <updateRate>0.0</updateRate>
         <cameraName>rrbot/high_res_camera</cameraName>
         <imageTopicName>image_raw</imageTopicName>
         <cameraInfoTopicName>camera_info</cameraInfoTopicName>
-        <frameName>camera_link</frameName>
+        <frameName>camera_link_high_res</frameName>
         <hackBaseline>0.07</hackBaseline>
         <distortionK1>0.0</distortionK1>
         <distortionK2>0.0</distortionK2>

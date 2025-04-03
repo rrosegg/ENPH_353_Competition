@@ -113,7 +113,7 @@ class PID_control:
         self.fcount = 0 # Only look for colors every 5th frame
         self.look_more = False ### TODO: Find a use for this
 
-        self.min_cb_area = 15000 #TODO: TUNE THIS
+        self.min_cb_area = 1000 #TODO: TUNE THIS
 
 
         self.motion_threshold = 100 

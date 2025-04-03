@@ -21,7 +21,7 @@ from sklearn.cluster import KMeans
 from collections import Counter
 from tensorflow.keras.models import load_model
 
-NUM_FRAMES = 10
+NUM_FRAMES = 2
 frame_clue_predictions = []
 frame_value_predictions = []
 class_names = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -37,7 +37,7 @@ class ClueBoardDetector:
 
         # # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
 
-        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+        self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
         self.ready = False
         self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
 
@@ -113,6 +113,8 @@ class ClueBoardDetector:
             for pt in inner_contour:
                 cv2.circle(contour_feed, tuple(pt[0]), 5, (0, 0, 255), -1)
             self.contour_pub.publish(self.bridge.cv2_to_imgmsg(contour_feed, encoding="bgr8"))
+        else: 
+            return
 
         dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype='float32')
         src = sort_corners(inner_contour)
