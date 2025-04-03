@@ -21,7 +21,7 @@ from sklearn.cluster import KMeans
 from collections import Counter
 from tensorflow.keras.models import load_model
 
-NUM_FRAMES = 5
+NUM_FRAMES = 10
 frame_clue_predictions = []
 frame_value_predictions = []
 class_names = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -29,10 +29,13 @@ class_names = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 class ClueBoardDetector:
     def __init__(self):
         rospy.init_node("clue_board_detector", anonymous=True)
+        self.published_clues = set()
         self.bridge = CvBridge()
-        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ok_callback is used
-        # self.image_sub = None  # Defer image sub until "ok"
-        # self.start_sub = rospy.Subscriber("/start_signal", String, self.ok_callback)
+        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
+        self.image_sub = None  # Defer image sub until "yes"
+        self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
+
+        # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
 
         self.mask_pub = rospy.Publisher('/masked_feed', Image, queue_size=1)
         self.inverted_pub = rospy.Publisher('/inverted_feed', Image, queue_size=1)
@@ -49,10 +52,10 @@ class ClueBoardDetector:
 
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
 
-    # def ok_callback(self, msg):
-    #     if msg.data.lower() == "ok" and self.image_sub is None:
-    #         rospy.loginfo("Start signal received. Beginning clueboard processing.")
-    #         self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+    def ready_callback(self, msg):
+        if msg.data.lower() == "yes" and self.image_sub is None:
+            rospy.loginfo("Start signal received. Beginning clueboard processing.")
+            self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
 
     def image_callback(self, msg):
         width, height = 600, 400
@@ -194,15 +197,31 @@ class ClueBoardDetector:
 
             confirmed_clue_result = fuzzy_clue if fuzzy_clue else clue_result
 
-            team_id = "Egg"
-            password = "pw"
-            clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
-            clue_prediction = value_result
-            rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
-            rospy.loginfo(f"Clue Type:  {clue_result}")
-            rospy.loginfo(f"Clue Value: {value_result}")
-            msg = f"{team_id},{password},{clue_location},{clue_prediction}"
-            self.pub_score.publish(msg)
+            if confirmed_clue_result not in self.published_clues:
+                self.published_clues.add(confirmed_clue_result)
+
+                team_id = "Egg"
+                password = "pw"
+                clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
+                clue_prediction = value_result
+                rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
+                rospy.loginfo(f"Clue Type:  {clue_result}")
+                rospy.loginfo(f"Clue Value: {value_result}")
+                msg = f"{team_id},{password},{clue_location},{clue_prediction}"
+                self.pub_score.publish(msg)
+            else:
+                rospy.loginfo(f"Already published clue for {confirmed_clue_result}, skipping.")
+
+            # team_id = "Egg"
+            # password = "pw"
+            # clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
+            # clue_prediction = value_result
+            # rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
+            # rospy.loginfo(f"Clue Type:  {clue_result}")
+            # rospy.loginfo(f"Clue Value: {value_result}")
+            # msg = f"{team_id},{password},{clue_location},{clue_prediction}"
+            # self.pub_score.publish(msg)
+            # # self.finish_sub.publish("read")
 
             frame_clue_predictions.clear()
             frame_value_predictions.clear()
