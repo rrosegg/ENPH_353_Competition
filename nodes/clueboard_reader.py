@@ -6,6 +6,7 @@ import numpy as np
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 import os
+import difflib
 
 import csv
 import random
@@ -24,7 +25,6 @@ NUM_FRAMES = 5
 frame_clue_predictions = []
 frame_value_predictions = []
 class_names = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-
 
 class ClueBoardDetector:
     def __init__(self):
@@ -45,6 +45,7 @@ class ClueBoardDetector:
 
         self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN_enhanced.h5")
 
+        self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
 
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
 
@@ -166,11 +167,11 @@ class ClueBoardDetector:
         clue_crops = get_letter_crops(top_boxes, width, height, inverted_projected)
         value_crops = get_letter_crops(bottom_boxes, width, height, inverted_projected)
 
-        # see resized letters upclose for troubleshooting:
-        for i, crop in enumerate(value_crops[:6]):  # limit to 5 to not overload ROS
-            color_crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-            self.resized_charbox_pub.publish(self.bridge.cv2_to_imgmsg(color_crop, encoding="bgr8"))
-            rospy.sleep(0.1)  # tiny delay so they don't overwrite each other
+        # # see resized letters upclose for troubleshooting:
+        # for i, crop in enumerate(value_crops[:6]):  # limit to 5 to not overload ROS
+        #     color_crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        #     self.resized_charbox_pub.publish(self.bridge.cv2_to_imgmsg(color_crop, encoding="bgr8"))
+        #     rospy.sleep(0.1)  # tiny delay so they don't overwrite each other
 
         clue_nn_input = prepare_for_nn(clue_crops)
         value_nn_input = prepare_for_nn(value_crops)
@@ -188,12 +189,23 @@ class ClueBoardDetector:
             clue_result = vote_across_frames(frame_clue_predictions)
             value_result = vote_across_frames(frame_value_predictions)
 
+            known_clue_types = ['SIZE','VICTIM','CRIME','TIME','PLACE','MOTIVE','WEAPON','BANDIT']
+            fuzzy_clue = best_match(clue_result, known_clue_types)
+
+            confirmed_clue_result = fuzzy_clue if fuzzy_clue else clue_result
+
+            team_id = "Egg"
+            password = "pw"
+            clue_location = known_clue_types.index(confirmed_clue_result) + 1 if confirmed_clue_result in known_clue_types else 1
+            clue_prediction = value_result
+            rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
             rospy.loginfo(f"Clue Type:  {clue_result}")
             rospy.loginfo(f"Clue Value: {value_result}")
+            msg = f"{team_id},{password},{clue_location},{clue_prediction}"
+            self.pub_score.publish(msg)
 
             frame_clue_predictions.clear()
             frame_value_predictions.clear()
-
 
 def sort_corners(pts):
     pts = pts.reshape(4, 2)
@@ -269,6 +281,9 @@ def vote_across_frames(pred_lists):
         final_chars.append(vote)
     return "".join(final_chars)
 
+def best_match(predicted, clue_types):
+    match = difflib.get_close_matches(predicted, clue_types, n=1, cutoff=0.6)
+    return match[0] if match else None
 
 def start_controller():
     cb_detector = ClueBoardDetector()
