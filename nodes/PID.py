@@ -9,6 +9,11 @@ from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
 
 import json  # for saving config from GUI
+import time # For troubleshooting
+
+# For teleporting during TS
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import SetModelState
 
 
 '''
@@ -34,11 +39,18 @@ class PID_control:
     STATE_UNPAVED  = 1
     STATE_OFFROAD  = 2
     STATE_MOUNTAIN = 3
+
+    # State machine steps!
     AVOID_YODA     = 444
     CP_ICE_SLICK   = 5
     CHILLIN        = 6
+    PED_XING    = 7   # dont hit pedestrian.
+    TRUCK_STOP     = 8 # wait for the truck then go.
+    DONT_SWIM      = 9 # find long path and send it
 
-    INTEGRAL_CEILING = 100
+    FCHECK_INTERVAL = 4
+
+    
 
     def __init__(self):
         rospy.init_node('topic_publisher', anonymous=True)
@@ -54,30 +66,51 @@ class PID_control:
         self.bridge = CvBridge()
 
         # PID Control Parameters
-        self.Kp = 0.1     # Proportional gain  
+        self.Kp = 0.10     # Proportional gain  
         self.Ki = 0.0    # Integral gain  ---- 0.001
-        self.Kd = 0.0     # Derivative gain  ---- 0.002
+        self.Kd = 0.02     # Derivative gain  ---- 0.002
         self.prev_error = 0
         self.integral = 0
+        self.integral_cap = 100
 
         # Speed Limits
-        self.maxspeed = 2.0 # 1.0 works
-        self.reducedspeed = 1.0 # 0.5 works
+        self.maxspeed = 0.0 # 2.0-1.0 works
+        self.reducedspeed = 0.0 # 1.0-0.5 works
 
         # State Control (initialized for first paved section)
         self.state = 0 # Update as we cross pink lines
         self.obj_detection = True
         self.thresh_val = 240
+        
+
+        """ Set up SimpleBlobDetector parameters. """
+        self.params = cv2.SimpleBlobDetector_Params()
+        self.params.filterByArea = True
+        self.params.minArea = 200    # Adjust based on resolution   (Used to be 100, then 50)
+        self.params.maxArea = 20000  # Prevent huge noise blobs (used to be 5000, then 15000, now 20000)
+        self.params.filterByCircularity = False
+        self.params.filterByConvexity = False
+        self.params.filterByInertia = False ## True??
+        self.params.blobColor = 255  # Looking for white blobs in binary image
 
         # Lane detection / Road stuff
         self.pinkpix = 0 # Number of pink pixels seen in the frame
         self.consec_pink_frames = 0
         self.consec_pinkless = 0
+        self.fcount = 0 # Only look for colors every 5th frame
 
         # Misc
         self.lastpix = 0 # For use in road detection 
-        # Wait for connections to publishers (necessary?)
-        rospy.sleep(0.5) # 1.0?
+        
+        # Wait for connection to publishers
+        rospy.sleep(1.0) # 0.5?
+
+
+        # Debugging params
+        self.lasttime = time.time()
+        self.show_time = True
+        self.debug = False
+        self.autopilot = 1  # 1 for on, 0 for off
 
         '''
         Some GUI stuff:
@@ -86,23 +119,30 @@ class PID_control:
         # self.window_name = "Tuner"
         # cv2.namedWindow(self.window_name)
 
-        # GUI Trackbar Stuff
-        cv2.namedWindow("Tuner")
-        cv2.createTrackbar("Kp x1000", "Tuner", int(self.Kp * 1000), 1000, lambda x: None)
-        cv2.createTrackbar("Ki x1000", "Tuner", int(self.Ki * 1000), 1000, lambda x: None)
-        cv2.createTrackbar("Kd x1000", "Tuner", int(self.Kd * 1000), 1000, lambda x: None)
-        cv2.createTrackbar("Max Speed x100", "Tuner", int(self.maxspeed * 100), 500, lambda x: None)
-        cv2.createTrackbar("Reduced Speed x100", "Tuner", int(self.reducedspeed * 100), 500, lambda x: None)
-        cv2.createTrackbar("Threshold", "Tuner", self.thresh_val, 255, lambda x: None)
-        cv2.createTrackbar("Sim State", "Tuner", self.state, 3, lambda x: None)
+        # GUI Trackbar Stuff 
+        if self.debug:
+            cv2.namedWindow("Tuner")
+            cv2.createTrackbar("Kp x1000", "Tuner", int(self.Kp * 1000), 1000, lambda x: None)
+            cv2.createTrackbar("Ki x1000", "Tuner", int(self.Ki * 1000), 1000, lambda x: None)
+            cv2.createTrackbar("Kd x1000", "Tuner", int(self.Kd * 1000), 1000, lambda x: None)
+            cv2.createTrackbar("Max Speed x100", "Tuner", int(self.maxspeed * 100), 500, lambda x: None)
+            cv2.createTrackbar("Reduced Speed x100", "Tuner", int(self.reducedspeed * 100), 500, lambda x: None)
+            cv2.createTrackbar("Threshold", "Tuner", self.thresh_val, 255, lambda x: None)
+            cv2.createTrackbar("Sim State", "Tuner", self.state, 3, lambda x: None)
+            cv2.createTrackbar("Autopilot", "Tuner", self.autopilot, 1, lambda x: None)
+            cv2.moveWindow("Tuner", 1500, 50)  # (x=100px from left, y=200px from top)
 
+        self.update_state() ## Call this to make sure everything aligns
+        
         
 
     # Returns correction value: u(t) = Kp*err + Ki*integral(err) + Kp*d/dt(err) 
     def pid_control(self, error):
         self.integral += error # Sums error
-        if abs(self.integral) > self.INTEGRAL_CEILING:
-            self.integral = self.INTEGRAL_CEILING if self.integral > 0 else (-1*self.INTEGRAL_CEILING)
+        # if abs(self.integral) > self.integral_cap:
+        #     self.integral = self.integral_cap if self.integral > 0 else (-1*self.integral_cap)
+        ##  Chat recommendation:
+        self.integral = max(min(self.integral, self.integral_cap), -self.integral_cap)
         derivative = error - self.prev_error # Difference term for sign
         self.prev_error = error # Update error
         return (self.Kp * error) + (self.Ki * self.integral) + (self.Kd * derivative)
@@ -112,32 +152,29 @@ class PID_control:
     def count_colorpix(self, img, color_name):
         """Return number of pixels matching the given color in the image."""
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        rgb = img
+        # rgb = img
 
         if color_name == "blue":
-            lower = np.array([100, 150, 50])
-            upper = np.array([130, 255, 255]) ## Play with these
+            lower, upper = np.array([85, 150, 50]), np.array([130, 256, 256]) # HSV = (240,100,100) Play with these! -> Work for all but two
+            # lower, upper = np.array([100, 70, 50]), np.array([250, 255, 220]) # HSV vals from Rose            
+            # lower, upper = np.array([230, 0, 0]), np.array([256,20,20]) # BGR = (255,0,0)?????????
         elif color_name == "pink":
-            # lower = np.array([140, 50, 50])
-            # upper = np.array([170, 255, 255])
-            # ## 
-            lower = np.array([290, 90, 90])
-            upper = np.array([310, 101, 101]) # 300,100,100 is the color!!
-
-            ## Pink is 255,0,255
+            lower, upper = np.array([150, 100, 100]), np.array([256, 256, 256]) # HSV = (300,100,100) -> 255,255,255    (150,100,100)
+            # lower, upper = np.array([250, 0, 250]), np.array([256, 0, 256]) # BGR = (255,0,255)
         elif color_name == "red":
-            lower = np.array([250,0,0])
-            upper = np.array([256,0,0])
+            lower, upper = np.array([0,200,200]), np.array([13,256,256]) # HSV = (0,100,100) on 300,100,100 scale
+            # lower, upper = np.array([0,0,250]), np.array([0,0,256]) # BGR = (0,0,255)
         else:
             rospy.logwarn(f"Unknown color requested: {color_name}")
             return 0
 
-        # mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.inRange(rgb, lower, upper)
+        mask = cv2.inRange(hsv, lower, upper)
+        # mask = cv2.inRange(rgb, lower, upper)
         pixel_count = cv2.countNonZero(mask)
 
-        # Optional: show mask for debugging
+        # # Optional: show mask for debugging
         # cv2.imshow(f"{color_name} mask", mask)
+        # cv2.waitKey(1)
 
         return pixel_count
  
@@ -171,26 +208,22 @@ class PID_control:
         # Update internal params based on current terrain state
         if self.state == self.STATE_PAVED:
             rospy.loginfo("Switched to: PAVED")
-            self.Kp = 0.05
-            self.Ki = 0.001
-            self.Kd = 0.002
+            self.Kp = 0.10
+            self.Ki = 0.0 # 0.001
+            self.Kd = 0.02 # 0.002
             self.thresh_val = 240
-            self.maxspeed = 1.5
-            self.reducedspeed = 0.5
+            self.maxspeed = 2.0 # 1.5
+            self.reducedspeed = 1.0 # 0.5
             self.obj_detection = True
 
         elif self.state == self.STATE_UNPAVED:
             rospy.loginfo("Switched to: UNPAVED")
-            # self.Kp = 0.04
-            # self.Ki = 0.002
-            # self.Kd = 0.003
-            '''Troubleshooting:'''
-            self.Kp = 1.0
-            self.Ki = 1.0
-            self.Kd = 1.0
-            self.thresh_val = 170
-            self.maxspeed = 1.2
-            self.reducedspeed = 0.4
+            self.Kp = 0.1
+            self.Ki = 0.005
+            self.Kd = 0.1
+            self.thresh_val = 175
+            self.maxspeed = 1.5
+            self.reducedspeed = 1.0
             self.obj_detection = False
 
         elif self.state == self.STATE_OFFROAD:
@@ -212,6 +245,18 @@ class PID_control:
         else:
             rospy.logwarn(f"Unknown state: {self.state}")
 
+
+        if self.debug:
+            cv2.setTrackbarPos("Kp x1000", "Tuner", int(self.Kp * 1000))
+            cv2.setTrackbarPos("Ki x1000", "Tuner", int(self.Ki * 1000))
+            cv2.setTrackbarPos("Kd x1000", "Tuner", int(self.Kd * 1000))
+            cv2.setTrackbarPos("Max Speed x100", "Tuner", int(self.maxspeed * 100))
+            cv2.setTrackbarPos("Reduced Speed x100", "Tuner", int(self.reducedspeed * 100))
+            cv2.setTrackbarPos("Threshold", "Tuner", self.thresh_val)
+            cv2.setTrackbarPos("Sim State", "Tuner", self.state)
+            cv2.setTrackbarPos("Autopilot", "Tuner", self.autopilot)
+
+
             
 
     def handle_offroad(self):
@@ -220,7 +265,7 @@ class PID_control:
 
 
     '''
-    The next few functions are for telemetry purposes!
+    The next few functions are for telemetry purposes! TODO: Make sure maketelemetry is never called
     '''
     def maketelemetry(self, thresh, y_coords):
         img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
@@ -229,6 +274,38 @@ class PID_control:
             start, stop = (0, y), (img.shape[1], y)
             cv2.line(img, start, stop, blue, thickness)
         return img
+
+    def spawn_position(self, position):
+        msg = ModelState()
+        msg.model_name = 'B1'
+
+        msg.pose.position.x = position[0]
+        msg.pose.position.y = position[1]
+        msg.pose.position.z = position[2]
+        msg.pose.orientation.x = position[3]
+        msg.pose.orientation.y = position[4]
+        msg.pose.orientation.z = position[5]
+        msg.pose.orientation.w = position[6]
+
+        rospy.wait_for_service('/gazebo/set_model_state')
+        try:
+            set_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+            resp = set_state(msg)
+        except rospy.ServiceException:
+            rospy.logerr("Service call failed")
+
+    def teleport(self, state):
+        pink_lines = [  
+                        [ 0, 0, 0, 0, 0, 0, 0],                                 # Spawn pos (unknown, drop to origin)
+                        [ 0.5,  -0.05,  0.05,   0.0, 0.0, 0.7071, 0.7071],      # First line (spawn not included)
+                        [-3.9,   0.465, 0.05,   0.0, 0.0, 1.0,    0.0],         # Second line, skip this one
+                        [-4.05, -2.3,   0.05,   0.0, 0.0, 0.0,    0.0]          # Third line
+                ]
+
+        if state > 3: state = 0
+
+        position = pink_lines[state]
+        self.spawn_position(position)
 
 
 
@@ -240,6 +317,7 @@ class PID_control:
         self.maxspeed = cv2.getTrackbarPos("Max Speed x100", "Tuner") / 100.0
         self.reducedspeed = cv2.getTrackbarPos("Reduced Speed x100", "Tuner") / 100.0
         self.thresh_val = cv2.getTrackbarPos("Threshold", "Tuner")
+        self.autopilot = cv2.getTrackbarPos("Autopilot", "Tuner")
 
         ## CHECK THAT THE LOGIC ON THIS IS RIGHT:
         new_state = cv2.getTrackbarPos("Sim State", "Tuner")
@@ -247,6 +325,7 @@ class PID_control:
             rospy.loginfo(f"Simulated state changed: {self.state} → {new_state}")
             self.state = new_state
             self.update_state()  # react to state change if needed
+            self.teleport(new_state) # teleport to new state if there was a change
 
     def save_settings(self, filename="pid_config.json"):
         # Try not to call this anywhere yet. Only once PID is more thoroughly tuned.
@@ -266,55 +345,6 @@ class PID_control:
 
 
 
-
-    # def detect_lane_blobs(self, thresh):
-    #     """
-    #     Detect two main white blobs (lane lines) and return their x-centers.
-    #     """
-    #     # Set up SimpleBlobDetector parameters.
-    #     params = cv2.SimpleBlobDetector_Params()
-    #     params.filterByArea = True
-    #     params.minArea = 100    # Adjust based on resolution
-    #     params.maxArea = 50000  # Prevent huge noise blobs
-    #     params.filterByCircularity = False
-    #     params.filterByConvexity = False
-    #     params.filterByInertia = False
-    #     params.blobColor = 255  # Looking for white blobs in binary image
-
-    #     detector = cv2.SimpleBlobDetector_create(params)
-
-    #     # Detect blobs
-    #     keypoints = detector.detect(thresh)
-
-    #     # Sort blobs by size (descending)
-    #     keypoints = sorted(keypoints, key=lambda k: k.size, reverse=True)
-
-    #     if len(keypoints) < 2:
-    #         return None, thresh  # Not enough blobs found
-
-    #     # Get the two largest blobs
-    #     left_blob = keypoints[0].pt  # (x, y)
-    #     right_blob = keypoints[1].pt
-
-    #     # if (right_blob[0] - left_blob[0]) < 10:
-    #     #     for n in keypoints:
-    #     #         right_blob = keypoints[n]
-    #     #         if (right_blob[0] - left_blob[0]) > 10:
-    #     #             break
-    #             ### If we never break then find out how to handle this.
-                    
-
-    #     # Optional: draw blobs
-    #     out_img = cv2.drawKeypoints(thresh, keypoints[:2], None, (0, 0, 255),
-    #                                 cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    #     cv2.imshow("blob debugger", out_img)
-
-    #     return (int(left_blob[0]), int(right_blob[0]))
-
-
-
-
-
     '''
     Implement the main image processing control loop below and figure out how it fits in 
     with the high level running loop (and calling blue detector guy).
@@ -328,32 +358,27 @@ class PID_control:
 
         ### Preprocessing (grayscale, resize, blur, binary threshold)
         resized = cv2.resize(cv_image, (0,0), fx=0.1, fy=0.1, interpolation=cv2.INTER_NEAREST) # INTER_AREA also an option
-        roi = resized[int(resized.shape[0]*0.65):, :]  # bottom 35%
+        roi = resized[int(resized.shape[0]*0.6):, :]  # bottom 40%
         height, width = roi.shape[:2]
         image_center = width // 2
 
         ## Preprocessing 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) # Reduce bandwidth quickly
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0) # Formerly (5,5)
         _, thresh = cv2.threshold(blurred, self.thresh_val, 255, cv2.THRESH_BINARY)
 
 
         # Check for colors (update state and publish cb_detector here)
-        self.cb_detector(resized)
-        self.scan_pink(roi)
+        self.fcount +=1
+        if self.fcount > self.FCHECK_INTERVAL:
+            # self.cb_detector(resized)
+            # self.scan_pink(roi)
+            # self.count_colorpix(roi, "red")
+            # self.scan_red ????
+            # self.truckchecker ???
+            self.fcount = 0
 
-
-        """ Set up SimpleBlobDetector parameters. """
-        params = cv2.SimpleBlobDetector_Params()
-        params.filterByArea = True
-        params.minArea = 100    # Adjust based on resolution
-        params.maxArea = 50000  # Prevent huge noise blobs
-        params.filterByCircularity = False
-        params.filterByConvexity = False
-        params.filterByInertia = False
-        params.blobColor = 255  # Looking for white blobs in binary image
-
-        detector = cv2.SimpleBlobDetector_create(params)
+        detector = cv2.SimpleBlobDetector_create(self.params)
 
         # Detect blobs then sort by descending size
         keypoints = detector.detect(thresh)
@@ -382,7 +407,7 @@ class PID_control:
                 rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
 
             else:
-                rospy.logwarn("No blobs detected, PID abandoned; spinning")
+                if self.fcount == 0: rospy.logwarn("No blobs detected, PID abandoned; spinning")
                 twist.angular.z = 1.0
                 twist.linear.x = 0.0
 
@@ -419,126 +444,18 @@ class PID_control:
             error = image_center - lane_center
             twist.angular.z = self.pid_control(error)
             twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
-            rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
-                
-
-
-            # Optional: draw blobs
-            out_img = cv2.drawKeypoints(thresh, keypoints[:2], None, (0, 0, 255),
-                                        cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-            cv2.imshow("blob debugger", out_img)
-            cv2.waitKey(1)
-
-        
-
-
-        
-
-
-
-
-        # blobs = self.detect_lane_blobs(thresh)
-
-        # twist = Twist()
-        # if blobs is None:
-        #     rospy.logwarn("Blob detection failed — fallback to white mean")
-        #     white_pixels = np.where(thresh > 0)
-        #     if white_pixels[1].size > 0:
-        #         road_center = int(np.mean(white_pixels[1]))
-        #         error = (thresh.shape[1] // 2) - road_center
-        #         twist.angular.z = self.pid_control(error)
-        #         twist.linear.x = self.reducedspeed
-        #     else:
-        #         twist.angular.z = 1.0
-        #         twist.linear.x = 0.0
-        # else: ### CHANGE TO ELIF
-        #     left_x, right_x = sorted(blobs)
-        #     lane_center = (left_x + right_x) // 2
-        #     image_center = thresh.shape[1] // 2
-        #     error = image_center - lane_center
-        #     twist.angular.z = self.pid_control(error)
-        #     twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
-        #     rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
-
+            if self.fcount == 0: rospy.loginfo(f"Blob error: {error}, Z: {twist.angular.z:.2f}")
         
         
         ### If one blob, check which half of screen it is on. Assume that this is right and set error to correct to the right.
         ### If no blobs, something fucked up. (Check intervals for expected behavior ?)
 
 
-        '''
-
-        twist = Twist()
-        the_pocket = 5 # if our error < the_pocket=5 pixels then we drive fast
-
-        # ## Attempt to FORCE fallback here:
-        white_pixels = np.where(thresh > 0)
-        if white_pixels[1].size > 0:
-            road_center = int(np.mean(white_pixels[1]))
-            error = image_center - road_center
-
-            twist.angular.z = self.pid_control(error)
-            twist.linear.x = self.maxspeed if abs(error) < the_pocket else self.reducedspeed
-            rospy.loginfo(f"Error: {error}, Angular Z: {twist.angular.z:.2f}, Linear X: {twist.linear.x:.2f}")
-
-        else:
-            twist.angular.z = 1.0
-            twist.linear.x = 0.05
-            print("No road at all we're spinning")
-
-        '''
-
-        self.pub_cmd.publish(twist)
+        if self.autopilot == 1: self.pub_cmd.publish(twist)
         
         
         ## Scan horizontal rows:
-        y_coords = [int(height * w) for w in (0.8, 0.65, 0.4)]    # Edit weights to change row heights
-        '''
-        midpoints = []
-
-        for y in y_coords:
-            row = thresh[y, :]
-            white = np.where(row == 255)[0]
-
-            for i in range(len(white) - 1):
-                gap = white[i + 1] - white[i]
-                if gap > (width*0.2):  # Wide enough gap → possible road center
-                    left, right = white[i], white[i + 1]
-                    midpoints.append((left + right) // 2)
-                    break  # Use first valid gap only --> Is this accurate?
-
-        twist = Twist()
-
-        if not midpoints:
-            rospy.logwarn("No midpoints found, attempting fallback strategy")
-            # Try fallback: if any white line exists, steer based on its avg position
-            white_pixels = np.where(thresh > 0)
-            if white_pixels[1].size > 0:
-                center_est = int(np.mean(white_pixels[1]))
-                error = image_center - center_est
-                twist.angular.z = self.pid_control(error)
-                twist.linear.x = self.reducedspeed
-                print(error)
-            else: 
-                # No white anywhere, stop & spin
-                error = 10000 # Garbage value -- will never get thrown into pid integral term
-                twist.angular.z = 1.0
-                twist.linear.x = 0.0
-        else:
-            road_center = sum(midpoints) // len(midpoints)
-
-            # ## Attempt to FORCE fallback here:
-            # white_pixels = np.where(thresh > 0)
-            # if white_pixels[1].size > 0:
-            #     road_center = int(np.mean(white_pixels[1]))
-
-            error = image_center - road_center
-            twist.angular.z = self.pid_control(error)
-            twist.linear.x = self.maxspeed if abs(error) < 5 else self.reducedspeed
-            rospy.loginfo(f"Error: {error}, Angular Z: {twist.angular.z:.2f}, Linear X: {twist.linear.x:.2f}")
-        
-        # self.pub_cmd.publish(twist)
-        '''
+        # y_coords = [int(height * w) for w in (0.8, 0.65, 0.4)]    # Edit weights to change row heights
 
         '''
         Figure out additional object detection and secondary state-based control flow algorithms here:
@@ -548,15 +465,48 @@ class PID_control:
             # Also figure out this control algorithm for the  
 
 
-        # === Visualized Feedback ===
-        telemetry = self.maketelemetry(thresh, y_coords)
-        # cv2.imshow("Telemetry", telemetry)
-        # cv2.imshow("raw", cv_image)
-        # cv2.imshow("gray", gray)
-        # cv2.imshow("blurred", blurred)
-        # cv2.imshow("thresh", thresh)    # This gives us road values -> doesn't 
-        ''' Can also show blobs and color masks in respective helper functions. '''
-        cv2.waitKey(1)
+
+        if self.debug:
+            if(self.fcount ==0): self.update_tunables() # Empirically speaking this is necessary
+            
+            # === Visualized Feedback ===
+            # telemetry = self.maketelemetry(thresh, y_coords)
+            # cv2.imshow("Telemetry", telemetry)
+            # cv2.imshow("raw", cv_image)
+            # cv2.imshow("gray", gray)
+            # cv2.imshow("blurred", blurred)
+            # cv2.imshow("thresh", thresh)    # This gives us road values -> doesn't 
+            ''' Can also show blobs and color masks in respective helper functions. '''
+
+            # blob_img, one_blob = None, None
+
+            # Optional: draw blobs
+            if len(keypoints) > 1:
+                blob_img = cv2.drawKeypoints(thresh, keypoints[:2], None, (0, 0, 255),
+                                            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+                cv2.imshow("Telemetry", blob_img)
+            elif len(keypoints) == 1:
+                one_blob = cv2.drawKeypoints(thresh, keypoints, None, (0, 0, 255),
+                                            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+                cv2.imshow("Telemetry", one_blob)
+            else:
+                cv2.imshow("Telemetry", thresh)
+            
+            if(self.fcount==0): cv2.moveWindow("Telemetry", 1500, 380)  # (x=1500px from left, y=150px from top)
+            cv2.waitKey(1)
+
+        if self.show_time:
+            print(f"Execution time: {(time.time()- self.lasttime)*1000} ms") # Display the time in ms
+            self.lasttime = time.time()
+
+
+        if(self.fcount == 0): 
+            del cv_image, resized, roi, gray, blurred, thresh # Will this do anything we'll see
+            # if blob_img is not None: del blob_img
+            # if one_blob is not None: del one_blob
+
+
+        
 
         '''Save PID coeffs here (but don't use this yet)'''
         # key = cv2.waitKey(1) & 0xFF
@@ -571,10 +521,16 @@ if __name__ == '__main__':
 
     while not rospy.is_shutdown():
         try:
-            data = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=5) # Path should be correct
+            data = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=1.0)
             Drive.process_image(data)
+
+            if Drive.debug:
+                cv2.waitKey(1)
         except rospy.ROSException:
-            # pass
-            rospy.logwarn("No image received in 5s, retrying...")
+            rospy.logwarn("No image received")
         
         rate.sleep()
+
+    # rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, Drive.process_image)
+    # rospy.spin()  # replaces the while loop
+
