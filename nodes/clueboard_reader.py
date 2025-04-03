@@ -43,7 +43,7 @@ class ClueBoardDetector:
         self.charbox_pub = rospy.Publisher('/charbox_feed', Image, queue_size=1)
         self.resized_charbox_pub = rospy.Publisher('/resized_charbox_feed', Image, queue_size=1)
 
-        self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.h5")
+        self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN_enhanced.h5")
 
 
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
@@ -166,11 +166,11 @@ class ClueBoardDetector:
         clue_crops = get_letter_crops(top_boxes, width, height, inverted_projected)
         value_crops = get_letter_crops(bottom_boxes, width, height, inverted_projected)
 
-        # # see resized letters upclose for troubleshooting:
-        # for i, crop in enumerate(value_crops[:5]):  # limit to 5 to not overload ROS
-        #     color_crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-        #     self.resized_charbox_pub.publish(self.bridge.cv2_to_imgmsg(color_crop, encoding="bgr8"))
-        #     rospy.sleep(0.1)  # tiny delay so they don't overwrite each other
+        # see resized letters upclose for troubleshooting:
+        for i, crop in enumerate(value_crops[:6]):  # limit to 5 to not overload ROS
+            color_crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+            self.resized_charbox_pub.publish(self.bridge.cv2_to_imgmsg(color_crop, encoding="bgr8"))
+            rospy.sleep(0.1)  # tiny delay so they don't overwrite each other
 
         clue_nn_input = prepare_for_nn(clue_crops)
         value_nn_input = prepare_for_nn(value_crops)
