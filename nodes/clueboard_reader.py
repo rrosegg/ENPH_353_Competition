@@ -31,11 +31,15 @@ class ClueBoardDetector:
         rospy.init_node("clue_board_detector", anonymous=True)
         self.published_clues = set()
         self.bridge = CvBridge()
-        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
-        self.image_sub = None  # Defer image sub until "yes"
-        self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
+        # self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
+        # # self.image_sub = None  # Defer image sub until "yes"
+        # ## self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
 
-        # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
+        # # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
+
+        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+        self.ready = False
+        self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
 
         self.mask_pub = rospy.Publisher('/masked_feed', Image, queue_size=1)
         self.inverted_pub = rospy.Publisher('/inverted_feed', Image, queue_size=1)
@@ -52,12 +56,19 @@ class ClueBoardDetector:
 
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
 
+    # def ready_callback(self, msg):
+    #     if msg.data.lower() == "yes" and self.image_sub is None:
+    #         rospy.loginfo("Start signal received. Beginning clueboard processing.")
+    #         self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+
     def ready_callback(self, msg):
-        if msg.data.lower() == "yes" and self.image_sub is None:
-            rospy.loginfo("Start signal received. Beginning clueboard processing.")
-            self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)
+        if msg.data.lower() == "yes":
+            rospy.loginfo("Start signal received. Processing enabled.")
+            self.ready = True
 
     def image_callback(self, msg):
+        if not self.ready:
+            return
         width, height = 600, 400
         rospy.loginfo("Received Image")
 
