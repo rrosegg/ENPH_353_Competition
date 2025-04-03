@@ -66,7 +66,15 @@ class PID_control:
         self.bridge = CvBridge()
 
         # Wait for connection to publishers
-        rospy.sleep(2) # 0.5?
+        rospy.sleep(1) # 0.5?
+        
+        # Quickstop
+        self.pub_cb_detected.publish('yes')
+        stop = Twist()
+        stop.linear.x = 0.0
+        stop.angular.z = 0.0
+        self.pub_cmd.publish(stop)
+        rospy.sleep(0.5)
 
         self.pub_score.publish('Egg,pw,0,NA') #TODO send -1 when comp is done.
 
@@ -129,8 +137,8 @@ class PID_control:
 
         # Debugging params
         self.lasttime = time.time()
-        self.show_time = False
-        self.debug = True
+        self.show_time = True
+        self.debug = False
         self.autopilot = 1  # 1 for on, 0 for off
 
         '''
@@ -443,78 +451,77 @@ class PID_control:
         rospy.sleep(1)
         '''
 
+        rospy.loginfo("Starting OFFROAD tracking...")
+    
+        self.pub_cmd.publish(stop)
+
         tracking_thing = True
         prev_error = 0
 
         while tracking_thing:
+            twist = Twist()
+
             try:
                 img = rospy.wait_for_message("/B1/rrbot/camera1/image_raw", Image, timeout=1.0)
                 frame = self.bridge.imgmsg_to_cv2(img, "bgr8")
             except CvBridgeError as e:
                 print(e)
+                continue
             
-            self.cb_detector(img)
-            #TODO: If detected, snap out of it.
-
+            self.cb_detector(frame)
             if self.cb_detected:
-                ## DRIVE TO PINK
+                rospy.loginfo("CB Detected! Ending offroad tracking.")
                 break
 
-            # Convert to HSV
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            # Define color range (e.g., GREEN in HSV or Silver)
-            if (self.state == 2):
-                lower_green = np.array([80, 90, 50])
-                upper_green = np.array([130, 120, 120])
-                mask = cv2.inRange(hsv, lower_green, upper_green)
+            if self.state == self.STATE_OFFROAD:
+                lower_color = np.array([80, 90, 50])
+                upper_color = np.array([130, 120, 120])
             else:
-                # Chase the car
-                lower_silver = np.array([80, 90, 50])
-                upper_silver = np.array([130, 120, 120])
-                mask = cv2.inRange(hsv, lower_silver, upper_silver)
+                # Define silver if needed here
+                lower_color = np.array([80, 90, 50])
+                upper_color = np.array([130, 120, 120])
 
-            # Find contours of the object
+            mask = cv2.inRange(hsv, lower_color, upper_color)
+
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 largest = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest)
+
+                if area < 800:
+                    rospy.loginfo("Object too small, stopping")
+                    self.pub_cmd.publish(stop)
+                    continue
+
                 x, y, w, h = cv2.boundingRect(largest)
                 obj_center_y = y + h // 2
-                img_center = mask.shape[0] // 2
 
-                area = cv2.contourArea(largest)
-                if area > 800:
-                    self.cmd_vel.publish(stop)
-                else:
-                    # PID error based on y-position (you could also use area or height)
-                    error =  - obj_center_y
-                    derivative = error - prev_error
-                    prev_error = error
+                error = -obj_center_y
+                derivative = error - prev_error
+                prev_error = error
 
-                    piderror = self.Kp * error + self.Kd * derivative
+                twist.angular.z = self.pid_control(error)
+                twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
 
-                    twist.angular.z = self.pid_control(piderror)
-                    twist.linear.x = self.maxspeed if abs(error) < 10 else self.reducedspeed
+                self.pub_cmd.publish(twist)
 
-                    self.cmd_vel.publish(twist)
-                    # Visualization
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-
-                
-
-                cv2.putText(frame, f"Vel: {velocity:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-
+                # Visual feedback
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, f"Area: {area:.2f}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             else:
-                print("Object not found. Stopping...")
-                self.cmd_vel.publish(stop)
+                rospy.loginfo("No object found. Stopping.")
+                self.pub_cmd.publish(stop)
 
-            cv2.imshow("Tracking", frame)
-            key = cv2.waitKey(1)
-            if key == 27:
-                break
+            if self.debug:
+                cv2.imshow("Tracking", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
 
-    
+
+        
 
 
 
