@@ -39,17 +39,14 @@ class PID_control:
     STATE_UNPAVED   = 1
     STATE_OFFROAD   = 2
     STATE_MOUNTAIN  = 3
+    LAUNCH_STATE    = 4
 
     # State machine steps!
     PED_XING        = 1   # dont hit pedestrian.
     TRUCK_STOP      = 2 # wait for the truck then go.
-    POST_TRUCK_CLARITY = 3
-    MOUNTAINEERING  = 4
-    DONT_SWIM       = 9 # find long path and send it    
-    CP_ICE_SLICK    = 5
-    AVOID_YODA      = 444
-    CHILLIN         = 6
-
+    DONT_SWIM       = 3
+    AVOID_YODA      = 4
+    MOUNTAINEERING  = 5
 
     FCHECK_INTERVAL = 4
 
@@ -60,7 +57,7 @@ class PID_control:
 
         # ROS Setup
         self.pub_cmd = rospy.Publisher('/B1/cmd_vel', Twist, queue_size=1)
-        self.pub_cb_detected = rospy.Publisher('/cb_detected', String, queue_size=1)
+        self.pub_cb_detected = rospy.Publisher('/clueboard_detected', String, queue_size=1)
         self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
         self.cb_read_sub = rospy.Subscriber('cb_read', String, queue_size=1)
         self.bridge = CvBridge()
@@ -69,17 +66,18 @@ class PID_control:
         rospy.sleep(1) # 0.5?
         
         # Quickstop
-        self.pub_cb_detected.publish('yes')
-        stop = Twist()
-        stop.linear.x = 0.0
-        stop.angular.z = 0.0
-        self.pub_cmd.publish(stop)
-        rospy.sleep(0.5)
+        
+        # stop = Twist()
+        # stop.linear.x = 0.1
+        # stop.angular.z = 0.0
+        # self.pub_cmd.publish(stop)
+        # # self.pub_cb_detected.publish('yes')
+        # rospy.sleep(1)
 
         self.pub_score.publish('Egg,pw,0,NA') #TODO send -1 when comp is done.
 
         # PID Control Parameters
-        self.Kp = 0.10     # Proportional gain  
+        self.Kp = 0.13     # Proportional gain  
         self.Ki = 0.0    # Integral gain  ---- 0.001
         self.Kd = 0.02     # Derivative gain  ---- 0.002
         self.prev_error = 0
@@ -87,11 +85,11 @@ class PID_control:
         self.integral_cap = 0.5 # Down from 100
 
         # Speed Limits
-        self.maxspeed = 0.0 # 2.0-1.0 works
+        self.maxspeed = 0.1 # 2.0-1.0 works
         self.reducedspeed = 0.0 # 1.0-0.5 works
 
         # State Control (initialized for first paved section)
-        self.state = 0 # Update as we cross pink lines
+        self.state = self.STATE_PAVED # Update as we cross pink lines
         self.obj_detection = True
         self.thresh_val = 240
         
@@ -111,7 +109,7 @@ class PID_control:
         # STATE MACHINE
         self.sm = self.PED_XING
 
-        self.first_valid_frame_received = False
+        self.first_valid_frame_received = True
 
 
         # Lane detection / Road stuff
@@ -119,6 +117,8 @@ class PID_control:
         self.consec_pinkless = 0
 
         self.yoda_was_seen = False
+        self.pause_for_truck = False
+        self.truckpix = 100000 # Assume for 800x800 that we want max 400x400 blob
 
         self.fcount = 0 # Only look for colors every 5th frame
 
@@ -138,7 +138,7 @@ class PID_control:
         # Debugging params
         self.lasttime = time.time()
         self.show_time = True
-        self.debug = False
+        self.debug = True
         self.autopilot = 1  # 1 for on, 0 for off
 
         '''
@@ -193,6 +193,8 @@ class PID_control:
         elif color_name == "red":
             lower, upper = np.array([0,200,200]), np.array([13,256,256]) # HSV = (0,100,100) on 300,100,100 scale
             # lower, upper = np.array([0,0,250]), np.array([0,0,256]) # BGR = (0,0,255)
+        elif color_name == "silver":
+            lower, upper = np.array([0,0,50]), np.array([0,0,75]) # HSV = (0,0,50-65)
         else:
             rospy.logwarn(f"Unknown color requested: {color_name}")
             return 0
@@ -228,7 +230,8 @@ class PID_control:
         inner_contour = None
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 1000: continue
+            if area < 6000: continue 
+            # 1000 too low, 10,000 too high.
             epsilon = 0.02 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             if len(approx) == 4 and area > max_area:
@@ -237,14 +240,23 @@ class PID_control:
             
         if inner_contour is not None and max_area > self.min_cb_area:
             rospy.loginfo("CB Visible, giving the ok to cb_reader node")
-            cb_detected = 'yes'
+            cb_detected = "yes"
             self.cb_detected = True
         else: 
-            cb_detected = 'no'
+            cb_detected = "no"
             self.cb_detected = False
         self.pub_cb_detected.publish(cb_detected)
 
-
+    def truckcheck(self, image):
+        if self.count_colorpix(image, "silver") > 1000: #wow feels bad
+            # 4k resolution has area of 12,000,000; shoot for 1/8 of that (100,000 for 800x800)
+            self.pause_for_truck = True
+            stop = Twist()
+            stop.linear.x = 0.0
+            stop.angular.z = 0.0
+            self.pub_cmd.publish(stop)
+            print("Truck nearby, pausing")
+        else: self.pause_for_truck = False
 
 
     def scan_red(self, cv_image):
@@ -256,7 +268,7 @@ class PID_control:
             self.motion_detector()
             self.sm = self.TRUCK_STOP
         else:
-            # We're looking for the second truck I presume.
+            # We're looking for the second truck (yoda's) I presume.
             pass
 
     '''TODO: Patch this'''
@@ -293,10 +305,9 @@ class PID_control:
             # motion_mask = cv2.dilate(motion_mask, None, iterations=2)
 
             # Show motion mask
-            # if self.debug: cv2.imshow("Motion", motion_mask)
-
-            cv2.imshow("Motion", motion_mask)
-            cv2.waitKey(1)
+            if self.debug: 
+                cv2.imshow("Motion", motion_mask)
+                cv2.waitKey(1)
 
             # Update previous frame
             prev_gray = gray.copy()
@@ -366,6 +377,7 @@ class PID_control:
             self.maxspeed = 2.2 # 1.5
             self.reducedspeed = 1.0 # 0.5
             self.obj_detection = True
+            self.autopilot = 1
 
         elif self.state == self.STATE_UNPAVED:
             rospy.loginfo("Switched to: UNPAVED")
@@ -377,11 +389,16 @@ class PID_control:
             self.reducedspeed = 1.0
             self.obj_detection = False
 
+            self.sm = self.DONT_SWIM # Stop checking for the truck
+
         elif self.state == self.STATE_OFFROAD:
             rospy.loginfo("Switched to: OFFROAD")
             self.obj_detection = False
+            self.sm = self.AVOID_YODA # Just for consistency with micro-state machine
+            
             # Insert logic for follow-yoda or hardcoded path
-            self.handle_offroad()
+            if not self.obj_detection: self.tunnel_teleport()
+            # Just teleport if we're not object detecting
 
         elif self.state == self.STATE_MOUNTAIN:
             rospy.loginfo("Switched to: MOUNTAIN")
@@ -392,6 +409,17 @@ class PID_control:
             self.maxspeed = 1.0
             self.reducedspeed = 0.3
             self.obj_detection = False
+        
+        elif self.state == self.LAUNCH_STATE:
+            self.autopilot = 0
+            stopped = Twist()
+            stopped.linear.x = 0.8
+            stopped.angular.z = 0
+            self.pub_cmd.publish(stopped)
+            rospy.sleep(2)
+            # self.state = self.STATE_PAVED
+            # self.update_state()
+
 
         else:
             rospy.logwarn(f"Unknown state: {self.state}")
@@ -414,15 +442,42 @@ class PID_control:
             cv2.setTrackbarPos("Autopilot", "Tuner", self.autopilot)
 
 
-            
+    def tunnel_teleport(self):
+        self.teleport(self.STATE_MOUNTAIN)
 
-    def handle_offroad(self): 
+        s3 = Twist()
+        s3.angular.z = 1.6
+
+        self.pub_cmd.publish(s3)
+        rospy.sleep(1)
+        
+        stop = Twist()
+        stop.linear.x = 0.0
+        stop.angular.z = 0.0
+        self.pub_cmd.publish(stop) # compilation error at comp
+        rospy.sleep(1)
+        
+        s3.angular.z = 0.0
+        s3.linear.x = 0.5
+        self.pub_cmd.publish(s3)
+        rospy.sleep(1)
+
+        self.pub_cmd.publish(stop)
+        rospy.sleep(2)
+    
+        self.pub_score.publish('Egg,pw,-1,NA') # End run.
+
+        while(True): self.autopilot = 0   #infinite loop
+        
+        
+
+    def handle_offroad(self):
         '''Hard coded routine'''
         stop = Twist()
         stop.linear.x = 0.0
         stop.angular.z = 0.0
         self.pub_cmd.publish(stop)
-        
+            
         '''
         routine = Twist()
         routine.linear.x = 0.5
@@ -622,6 +677,21 @@ class PID_control:
         except CvBridgeError as e:
             print(e)
 
+        # if self.state == self.LAUNCH_STATE:
+        #     '''Remove if needed'''
+        #     # Wait until we see a CB or any valid blobs before starting
+        #     self.cb_detector(self.bridge.imgmsg_to_cv2(data, "bgr8"))
+        #     if self.cb_detected:
+        #         rospy.loginfo("CB detected during launch. Switching to PAVED mode.")
+        #         self.state = self.STATE_PAVED
+        #         self.autopilot = 1
+        #         self.update_state()
+        #     else:
+        #         # Optional: add a timeout fallback
+        #         rospy.loginfo_throttle(2, "Waiting for CB to appear...")
+        #         return
+            
+
         ### Preprocessing (grayscale, resize, blur, binary threshold)
         resized = cv2.resize(cv_image, (0,0), fx=0.4, fy=0.4, interpolation=cv2.INTER_NEAREST) # INTER_AREA also an option
         roi = resized[int(resized.shape[0]*0.6):, :]  # bottom 40%
@@ -642,9 +712,11 @@ class PID_control:
             self.scan_red(roi)
         # self.count_colorpix(roi, "red")
         if(self.sm == self.TRUCK_STOP):
+            self.truckcheck(cv_image)
             # Listen for 3, if 3 published then once no blue visible
             # self.motion_detector()
-            self.sm +=1
+            
+            # self.sm +=1
 
 
             # Check is motion is on the right (and less than x number of pixels)
@@ -732,15 +804,20 @@ class PID_control:
 
 
         # Only enable movement after first valid detection
-        if not self.first_valid_frame_received:
-            if len(keypoints) >= 1:  # Set stricter condition if needed
-                rospy.loginfo("First valid frame processed. Robot is now allowed to move.")
-                self.first_valid_frame_received = True
-            else:
-                # Don't publish twist yet
-                return
+        # if not self.first_valid_frame_received:
+        #     if len(keypoints) >= 1:  # Set stricter condition if needed
+        #         rospy.loginfo("First valid frame processed. Robot is now allowed to move.")
+        #         self.first_valid_frame_received = True
+        #     else:
+        #         # Don't publish twist yet
+        #         return
 
-        if self.autopilot == 1 and self.first_valid_frame_received: 
+        if self.pause_for_truck: twist.linear.x, twist.angular.z = 0.0, 0.0
+
+        # if self.autopilot == 1 and self.first_valid_frame_received: 
+        #     self.pub_cmd.publish(twist)
+
+        if self.autopilot == 1: 
             self.pub_cmd.publish(twist)
         
         
@@ -808,6 +885,11 @@ class PID_control:
 if __name__ == '__main__':
     Drive = PID_control()
     rate = rospy.Rate(30)  # 30 Hz -- 30 fps but not necessarily
+
+    boottwist = Twist()
+    boottwist.linear.x = 0.0
+    boottwist.angular.z = 0.0
+    Drive.pub_cmd.publish(boottwist) #Just do this once
 
     while not rospy.is_shutdown():
         try:

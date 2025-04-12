@@ -21,7 +21,8 @@ from sklearn.cluster import KMeans
 from collections import Counter
 from tensorflow.keras.models import load_model
 
-NUM_FRAMES = 2
+NUM_FRAMES = 3
+SEND_LIMIT = 3
 frame_clue_predictions = []
 frame_value_predictions = []
 class_names = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -31,18 +32,20 @@ class ClueBoardDetector:
         rospy.init_node("clue_board_detector", anonymous=True)
         self.published_clues = set()
         self.bridge = CvBridge()
-        self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
+        # self.image_sub = rospy.Subscriber("/B1/rrbot/camera1/image_raw", Image, self.image_callback)  # comment out when ready_callback is used
         # self.image_sub = None  # Defer image sub until "yes"
         #self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
 
         # # # self.finish_sub = rospy.Publisher("/clueboard_read", String, queue_size=1)
-
-        # self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
-        # self.ready = False
-        # self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
-
-        self.image_sub = None
+        self.ready = False
         self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
+
+
+
+        self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
+
+        # self.image_sub = None
+        # self.start_sub = rospy.Subscriber("/clueboard_detected", String, self.ready_callback)
         self.mask_pub = rospy.Publisher('/masked_feed', Image, queue_size=1)
         self.inverted_pub = rospy.Publisher('/inverted_feed', Image, queue_size=1)
         self.contour_pub = rospy.Publisher('/contoured_feed', Image, queue_size=1)
@@ -52,26 +55,36 @@ class ClueBoardDetector:
         self.charbox_pub = rospy.Publisher('/charbox_feed', Image, queue_size=1)
         self.resized_charbox_pub = rospy.Publisher('/resized_charbox_feed', Image, queue_size=1)
 
+        self.published_array = np.zeros(8)
+
         self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN_enhanced.h5")
+        # self.model = load_model("/home/fizzer/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN_new.h5")
+
 
         self.pub_score = rospy.Publisher('/score_tracker', String, queue_size=1)
 
-        rospy.sleep(1)
+        rospy.sleep(0.1)
         # self.model = load_model("/ros_ws/src/my_controller/reference/CNNs/ClueboardCNN.keras")
 
-    def ready_callback(self, msg):
-        if msg.data.lower() == 'yes' and self.image_sub is None:
-            rospy.loginfo("Start signal received. Beginning clueboard processing.")
-            self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
-
     # def ready_callback(self, msg):
-    #     if msg.data.lower() == "yes":
-    #         rospy.loginfo("Start signal received. Processing enabled.")
-    #         self.ready = True
+    #     if msg.data.lower() == 'yes' and self.image_sub is None:
+    #         rospy.loginfo("Start signal received. Beginning clueboard processing.")
+    #         self.image_sub = rospy.Subscriber("/B1/rrbot/high_res_camera/image_raw", Image, self.image_callback)
+
+    def ready_callback(self, msg):
+        if msg.data.lower() == "yes":
+            rospy.loginfo("Start signal received. Processing enabled.")
+            self.ready = True
 
     def image_callback(self, msg):
-        # if not self.ready:
-        #     return
+        if not self.ready:
+            return
+
+        # self.start_sub = rospy.Subscriber("/clueboard_detected", String)
+        # if self.start_sub == "no":
+        #     return 
+        # # Bail early if we aren't ready to read
+
         width, height = 600, 400
         rospy.loginfo("Received Image")
 
@@ -101,7 +114,7 @@ class ClueBoardDetector:
         inner_contour = None
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 1000:
+            if area < 20000: #formerly 1000
                 continue
             epsilon = 0.02 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
@@ -239,8 +252,20 @@ class ClueBoardDetector:
             rospy.loginfo(f"Best Clue Match: {confirmed_clue_result}")
             rospy.loginfo(f"Clue Type:  {clue_result}")
             rospy.loginfo(f"Clue Value: {value_result}")
+
+            self.published_array[int(clue_location)] += 1
+
             msg = f"{team_id},{password},{clue_location},{clue_prediction}"
-            self.pub_score.publish(msg)
+            # if(self.published_array[int(clue_location)] < SEND_LIMIT and self.start_sub == 'yes'):
+            #     self.pub_score.publish(msg)
+
+            if(self.published_array[int(clue_location)] < SEND_LIMIT):
+                self.pub_score.publish(msg)
+            elif(int(clue_location)==6):
+                self.pub_score.publish(msg) # Clue location 6 gets a few tries
+            
+
+            # self.pub_score.publish(msg)
             # self.finish_sub.publish("read")
 
             frame_clue_predictions.clear()
